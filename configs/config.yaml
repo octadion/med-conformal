@@ -1,0 +1,136 @@
+experiment:
+  name: "organamnist_conformal_xai"
+  seed: 42
+  save_dir: "outputs"
+  
+data:
+  dataset: "organamnist"
+  size: 224
+  batch_size: 128
+  num_workers: 4
+  download: true
+  data_dir: "./data"
+  
+  # Data augmentation for training
+  augmentation:
+    enabled: true
+    random_horizontal_flip: 0.5
+    random_rotation: 10
+    color_jitter: 0.1
+
+model:
+  architecture: "resnet18"
+  pretrained: true
+  num_classes: 11
+  dropout: 0.3
+  freeze_backbone: false  # Fine-tune entire network
+
+training:
+  epochs: 50
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  optimizer: "adam"
+  scheduler: "cosine"  # Cosine annealing
+  early_stopping:
+    enabled: true
+    patience: 10
+    min_delta: 0.001
+  
+  # Loss function
+  criterion: "cross_entropy"
+  label_smoothing: 0.1
+
+conformal:
+  # Target miscoverage rate (alpha)
+  alpha: 0.1  # 90% coverage target
+  
+  # Conformal methods to evaluate
+  methods:
+    - "naive"           # Baseline: softmax confidence
+    - "lac"             # Label-conditional AC
+    - "raps_size"       # RAPS with size-based lambda
+    - "raps_temp"       # RAPS with temperature scaling
+    - "raps_adaptive"   # RAPS with adaptiveness (MAIN METHOD)
+  
+  # RAPS parameters
+  kreg: null  # Auto-tune from data
+  lamda: null  # Auto-tune from data
+  randomized: true
+  allow_zero_sets: false
+  pct_paramtune: 0.3  # 30% of val set for parameter tuning
+  
+  # Temperature scaling
+  temperature_scaling:
+    enabled: true
+    max_iters: 10
+    lr: 0.01
+    epsilon: 0.01
+
+gradcam:
+  # Target layer for Grad-CAM
+  target_layer: "layer4"  # Last conv layer of ResNet18
+  
+  # Number of samples to visualize
+  n_samples_correct: 20
+  n_samples_incorrect: 20
+  n_samples_per_class: 2
+  
+  # Confidence stratification
+  confidence_stratification:
+    enabled: true
+    high_conf_threshold: 1    # set size = 1
+    medium_conf_range: [2, 3]  # set size 2-3
+    low_conf_threshold: 4      # set size >= 4
+  
+  # Visualization settings
+  colormap: "jet"
+  alpha: 0.5  # Overlay transparency
+
+visualization:
+  # Plot settings
+  dpi: 300
+  format: "png"
+  style: "seaborn-v0_8-paper"
+  
+  # Figure sizes
+  figure_size:
+    default: [10, 8]
+    wide: [15, 6]
+    square: [8, 8]
+  
+  # What to generate
+  generate:
+    training_curves: true
+    confusion_matrix: true
+    coverage_plots: true
+    set_size_plots: true
+    per_class_analysis: true
+    gradcam_visualizations: true
+    calibration_plots: true
+  
+  # Save individual Grad-CAM images
+  save_individual: true
+  create_grids: true
+
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  console: true
+  file: true
+  
+evaluation:
+  # Metrics to compute
+  metrics:
+    - "accuracy"
+    - "precision"
+    - "recall"
+    - "f1_score"
+    - "auc_roc"
+    - "coverage"
+    - "avg_set_size"
+    - "conditional_coverage"
+  
+  # Save predictions for analysis
+  save_predictions: true
+  
+  # Generate LaTeX tables
+  generate_latex: true
