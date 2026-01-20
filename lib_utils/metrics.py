@@ -301,6 +301,52 @@ def compute_calibration_error(y_prob: np.ndarray, y_true: np.ndarray,
     
     return float(ece)
 
+def compute_entropy_metrics(prediction_sets, y_true, y_prob, alpha=0.1):
+    from scipy.stats import entropy
+    
+    entropies = entropy(y_prob, axis=1)
+
+    t1 = np.quantile(entropies, 0.33)
+    t2 = np.quantile(entropies, 0.66)
+    
+    strata_map = {
+        'Easy (Low Ent)': np.where(entropies <= t1)[0],
+        'Ambig (Med Ent)': np.where((entropies > t1) & (entropies <= t2))[0],
+        'Hard (High Ent)': np.where(entropies > t2)[0]
+    }
+    
+    results = {}
+    target = 1 - alpha
+    
+    print("\n[ANALYSIS] Entropy-Stratified Coverage:")
+    print(f"{'Stratum':<20} {'Coverage':<10} {'Size':<10} {'Count':<10} {'Violation'}")
+    print("-" * 65)
+    
+    for name, idxs in strata_map.items():
+        if len(idxs) == 0: continue
+        
+        covered = 0
+        set_sizes = []
+        for i in idxs:
+            is_in = y_true[i] in prediction_sets[i]
+            covered += int(is_in)
+            set_sizes.append(len(prediction_sets[i]))
+            
+        cov = covered / len(idxs)
+        avg_size = np.mean(set_sizes)
+        violation = abs(cov - target)
+        
+        results[name] = {
+            'coverage': cov,
+            'avg_size': avg_size,
+            'count': len(idxs)
+        }
+        
+        print(f"{name:<20} {cov:.4f}     {avg_size:.2f}       {len(idxs):<10} {violation:.4f}")
+        
+    print("-" * 65 + "\n")
+    return results
+
 
 def compute_comprehensive_metrics(y_true: np.ndarray, 
                                   y_pred: np.ndarray,
@@ -333,6 +379,8 @@ def compute_comprehensive_metrics(y_true: np.ndarray,
     )
 
     results['confusion_matrix'] = compute_confusion_matrix(y_true, y_pred)
+
+    results['entropy_stratified'] = compute_entropy_metrics(prediction_sets, y_true, y_prob)
     
     if prediction_sets is not None:
         results['uncertainty'] = {
