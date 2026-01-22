@@ -380,7 +380,7 @@ class MondrianCP(nn.Module):
     
     def _calculate_entropy(self, logits):
         """Compute predictive entropy."""
-        probs = torch.softmax(logits, dim=1).numpy()
+        probs = torch.softmax(logits, dim=1).cpu().numpy()  #Added .cpu()
         return entropy(probs, axis=1)
     
     def _get_entropy_boundaries(self, entropy_values):
