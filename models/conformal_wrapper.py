@@ -292,6 +292,175 @@ def _forward_raps(self, x):
             prediction_sets.append(pred_set)
             
         return logits, prediction_sets
+    
+class MondrianCP(nn.Module):
+    """
+    Mondrian (Group-Conditional) Conformal Prediction.
+    
+    Uses entropy-defined strata with SEPARATE quantile calibration per group.
+    This provides theoretical guarantee of per-stratum validity under 
+    exchangeability, at the cost of potential efficiency loss on easy strata.
+    
+    Args:
+        model: Trained classifier
+        calib_loader: Calibration data loader
+        tune_loader: Tuning set (to define entropy boundaries)
+        alpha: Miscoverage level (default 0.1 for 90% coverage)
+        n_strata: Number of entropy strata (default 3 for tertiles)
+        device: 'cuda' or 'cpu'
+    """
+    
+    def __init__(self, model, calib_loader, tune_loader, alpha=0.1, 
+                 n_strata=3, device='cuda'):
+        super().__init__()
+        self.model = model
+        self.alpha = alpha
+        self.n_strata = n_strata
+        self.device = device
+        self.num_classes = model.num_classes
+        
+        # Get logits and labels for calibration
+        print(f"   [Mondrian-CP] Calibrating with {n_strata} entropy strata...")
+        self.logits_cal, self.labels_cal = self._get_logits_labels(calib_loader)
+        logits_tune, _ = self._get_logits_labels(tune_loader)
+        
+        # Define entropy boundaries based on tuning set
+        tune_entropy = self._calculate_entropy(logits_tune)
+        self.entropy_boundaries = self._get_entropy_boundaries(tune_entropy)
+        
+        # Assign calibration data to strata
+        cal_entropy = self._calculate_entropy(self.logits_cal)
+        cal_strata = self._assign_to_strata(cal_entropy)
+        
+        # Compute separate quantile for each stratum
+        self.stratum_quantiles = {}
+        self.stratum_sizes = {}
+        
+        for s in range(n_strata):
+            stratum_mask = (cal_strata == s)
+            n_s = stratum_mask.sum()
+            
+            if n_s == 0:
+                print(f"      Warning: Stratum {s} has 0 samples in calibration!")
+                self.stratum_quantiles[s] = 1.0  # Conservative fallback
+                self.stratum_sizes[s] = 0
+                continue
+            
+            # Get APS scores for this stratum
+            stratum_logits = self.logits_cal[stratum_mask]
+            stratum_labels = self.labels_cal[stratum_mask]
+            
+            scores = self._compute_aps_scores(stratum_logits, stratum_labels)
+            
+            # Compute stratum-specific quantile
+            q_level = np.ceil((n_s + 1) * (1 - alpha)) / n_s
+            q_hat_s = np.quantile(scores, q_level, method='higher')
+            
+            self.stratum_quantiles[s] = q_hat_s
+            self.stratum_sizes[s] = n_s.item()
+            
+            print(f"      Stratum {s}: n={n_s}, q_hat={q_hat_s:.4f}")
+    
+    def _get_logits_labels(self, loader):
+        """Extract logits and labels from dataloader."""
+        self.model.eval()
+        logits_list, labels_list = [], []
+        
+        with torch.no_grad():
+            for x, y in loader:
+                x = x.to(self.device)
+                out = self.model(x)
+                logits_list.append(out.cpu())
+                
+                if len(y.shape) > 1:
+                    y = y.squeeze()
+                labels_list.append(y.cpu())
+        
+        return torch.cat(logits_list), torch.cat(labels_list)
+    
+    def _calculate_entropy(self, logits):
+        """Compute predictive entropy."""
+        probs = torch.softmax(logits, dim=1).numpy()
+        return entropy(probs, axis=1)
+    
+    def _get_entropy_boundaries(self, entropy_values):
+        """Define stratum boundaries based on quantiles."""
+        quantiles = np.linspace(0, 1, self.n_strata + 1)[1:-1]  # Exclude 0 and 1
+        boundaries = np.quantile(entropy_values, quantiles)
+        return boundaries
+    
+    def _assign_to_strata(self, entropy_values):
+        """Assign samples to strata based on entropy."""
+        strata = np.zeros(len(entropy_values), dtype=int)
+        
+        for i, ent in enumerate(entropy_values):
+            stratum = 0
+            for boundary in self.entropy_boundaries:
+                if ent > boundary:
+                    stratum += 1
+                else:
+                    break
+            strata[i] = stratum
+        
+        return strata
+    
+    def _compute_aps_scores(self, logits, labels):
+        """Compute APS conformity scores."""
+        probs = torch.softmax(logits, dim=1)
+        sorted_probs, idx = torch.sort(probs, dim=1, descending=True)
+        cumsum = torch.cumsum(sorted_probs, dim=1)
+        
+        # Find rank of true label
+        rows = torch.arange(len(labels))
+        ranks = torch.zeros(len(labels), dtype=torch.long)
+        
+        for i, lbl in enumerate(labels):
+            rank = (idx[i] == lbl).nonzero(as_tuple=True)[0]
+            ranks[i] = rank.item() if len(rank) > 0 else 0
+        
+        scores = cumsum[rows, ranks]
+        return scores.numpy()
+    
+    def forward(self, x):
+        """
+        Forward pass: predict with stratum-specific quantiles.
+        
+        Returns:
+            logits: Model outputs
+            prediction_sets: List of numpy arrays (one per sample)
+        """
+        with torch.no_grad():
+            logits = self.model(x)
+            
+            # Compute entropy for test samples
+            test_entropy = self._calculate_entropy(logits)
+            test_strata = self._assign_to_strata(test_entropy)
+            
+            # Compute probabilities and cumulative sums
+            probs = torch.softmax(logits, dim=1)
+            sorted_probs, idx = torch.sort(probs, dim=1, descending=True)
+            cumsum = torch.cumsum(sorted_probs, dim=1)
+            
+            prediction_sets = []
+            
+            for i in range(x.size(0)):
+                # Get stratum-specific quantile
+                stratum = test_strata[i]
+                q_hat = self.stratum_quantiles[stratum]
+                
+                # Build prediction set (include until cumsum exceeds q_hat)
+                mask = cumsum[i] <= q_hat
+                
+                if mask.sum() == 0:
+                    k_star = 0
+                else:
+                    k_star = mask.nonzero(as_tuple=True)[0][-1].item()
+                
+                pred_set = idx[i, :k_star+1].cpu().numpy()
+                prediction_sets.append(pred_set)
+            
+            return logits, prediction_sets
+
 
 def predict_with_sets(conformal_model, dataloader):
     """

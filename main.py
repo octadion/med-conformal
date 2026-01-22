@@ -24,7 +24,7 @@ sys.path.append('.')
 
 from data.dataloader import MedMNISTDataLoader
 from models.base_model import get_model
-from models.conformal_wrapper import StandardLAC, StandardAPS, SizeOptimizedRAPS, EntropyStratifiedRAPS
+from models.conformal_wrapper import StandardLAC, StandardAPS, SizeOptimizedRAPS, EntropyStratifiedRAPS, MondrianCP
 from models.gradcam import generate_gradcam_samples
 from training.trainer import Trainer
 from training.evaluator import ComprehensiveEvaluator
@@ -120,7 +120,7 @@ def main():
             raps_std = SizeOptimizedRAPS(trained_model, cal_loader, pt_loader, alpha=0.1, k_reg=2, device=device)
             # 4. Entropy RAPS (Ours - Safety Optimized)
             ours = EntropyStratifiedRAPS(trained_model, cal_loader, pt_loader, alpha=0.1, k_reg=2, device=device)
-            
+            mondrian = MondrianCP(trained_model, cal_loader, pt_loader, alpha=0.1, n_strata=3, device=device)
             # Evaluate
             evaluator = ComprehensiveEvaluator(current_config, data_loader.class_names)
 
@@ -128,7 +128,8 @@ def main():
             res_aps = evaluator.evaluate_method(aps, test_loader, "APS")
             res_raps = evaluator.evaluate_method(raps_std, test_loader, "RAPS_Standard")
             res_ours = evaluator.evaluate_method(ours, test_loader, "EntropyRAPS", compute_gradcam=False)
-        
+            res_mondrian = evaluator.evaluate_method(mondrian, test_loader, "Mondrian")
+
             if seed_idx == 0 and dataset_name == 'organamnist':
                 print("   [VISUALIZATION] Generating Grad-CAM Contrastive Maps...")
                 viz_dir = save_dir / 'visualizations'
@@ -162,6 +163,12 @@ def main():
                 'Coverage': res_ours['uncertainty']['coverage'],
                 'Avg_Set_Size': res_ours['uncertainty']['avg_set_size'],
                 'Hard_Case_Coverage': get_hard_cov(res_ours)
+            })
+            dataset_results.append({
+                'Seed': seed, 'Method': 'Mondrian',
+                'Coverage': res_mondrian['uncertainty']['coverage'],
+                'Avg_Set_Size': res_mondrian['uncertainty']['avg_set_size'],
+                'Hard_Case_Coverage': get_hard_cov(res_mondrian)
             })
             
         save_paper_results(dataset_name, dataset_results, save_dir)
