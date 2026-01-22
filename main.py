@@ -8,19 +8,30 @@ import pandas as pd
 import copy
 import os
 
+DRIVE_PATH = Path('/content/drive/MyDrive')
+
+if DRIVE_PATH.exists():
+    print(f"✅ Google Drive detected at {DRIVE_PATH}")
+    BASE_OUTPUT_DIR = DRIVE_PATH / 'MedConformal_Final_Submission'
+else:
+    print("⚠️ Google Drive NOT detected. Using local 'outputs' folder.")
+    BASE_OUTPUT_DIR = Path('outputs')
+
+BASE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+print(f"📂 Output Directory: {BASE_OUTPUT_DIR}")
+
 sys.path.append('.')
-sys.path.append('/mnt/user-data/uploads')
 
 from data.dataloader import MedMNISTDataLoader
 from models.base_model import get_model
-from models.conformal_wrapper import StandardLAC, EntropyStratifiedRAPS
+from models.conformal_wrapper import StandardLAC, StandardAPS, SizeOptimizedRAPS, EntropyStratifiedRAPS
 from models.gradcam import generate_gradcam_samples
 from training.trainer import Trainer
 from training.evaluator import ComprehensiveEvaluator
 from lib_utils.logger import ExperimentLogger
 
 DATASETS_TO_RUN = ['organamnist', 'pathmnist']
-SEEDS = [42, 10, 2024, 99, 123]               
+SEEDS = [42, 10, 2024, 99, 123]
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -39,14 +50,18 @@ def save_paper_results(dataset_name, agg_results, save_dir):
     metrics = ['Coverage', 'Avg_Set_Size', 'Hard_Case_Coverage']
     
     for metric in metrics:
-        final_table[metric] = summary[metric].apply(
-            lambda x: f"{x['mean']:.4f} ({x['std']:.4f})", axis=1
-        )
+        if metric in summary.columns:
+            final_table[metric] = summary[metric].apply(
+                lambda x: f"{x['mean']:.4f} ({x['std']:.4f})", axis=1
+            )
     
-    os.makedirs(save_dir, exist_ok=True)
     csv_path = save_dir / f'PAPER_TABLE_{dataset_name}.csv'
     final_table.to_csv(csv_path)
     
+    df.to_csv(save_dir / f'RAW_RESULTS_{dataset_name}.csv', index=False)
+    
+    print(f"\n[RESULTS] Final Table for {dataset_name} saved to:")
+    print(f"   -> {csv_path}")
     print(final_table)
 
 def main():
@@ -64,11 +79,13 @@ def main():
         current_config = copy.deepcopy(base_config)
         current_config['data']['dataset'] = dataset_name
 
-        current_config['experiment']['save_dir'] = f"outputs/{dataset_name}_final"
+        current_config['experiment']['save_dir'] = str(BASE_OUTPUT_DIR / f"{dataset_name}_final")
         
         save_dir = Path(current_config['experiment']['save_dir'])
-        logger = ExperimentLogger(str(save_dir), f"{dataset_name}_exp")
+        save_dir.mkdir(parents=True, exist_ok=True)
         
+        logger = ExperimentLogger(str(save_dir), f"{dataset_name}_exp")
+
         set_seed(SEEDS[0]) 
         data_loader = MedMNISTDataLoader(current_config)
         train_loader, val_loader, test_loader = data_loader.load_data()
@@ -79,14 +96,14 @@ def main():
         trained_model = trainer.train(train_loader, val_loader, logger)
         
         dataset_results = []
-
         print(f"\n[EVALUATION] Starting Multi-Seed Conformal Evaluation...")
         
+        # 2. Loop Seeds (Robustness)
         for seed_idx, seed in enumerate(SEEDS):
             print(f"   > Running Seed {seed}...")
             set_seed(seed)
             
-            # Split Validation (Random per seed)
+            # Split Validation Random per Seed
             val_ds = val_loader.dataset
             paramtune_ds, calib_ds = data_loader.split_validation_set(
                 val_ds, pct_paramtune=current_config['conformal']['pct_paramtune']
@@ -95,16 +112,21 @@ def main():
             pt_loader = torch.utils.data.DataLoader(paramtune_ds, batch_size=32, shuffle=False)
             cal_loader = torch.utils.data.DataLoader(calib_ds, batch_size=32, shuffle=False)
             
-            # Init Wrappers
-            # 1. LAC (Baseline)
+            # 1. LAC
             lac = StandardLAC(trained_model, cal_loader, alpha=0.1, device=device)
-            # 2. Ours (Entropy)
+            # 2. APS (Added Baseline)
+            aps = StandardAPS(trained_model, cal_loader, alpha=0.1, device=device)
+            # 3. RAPS Standard (Size Optimized)
+            raps_std = SizeOptimizedRAPS(trained_model, cal_loader, pt_loader, alpha=0.1, k_reg=2, device=device)
+            # 4. Entropy RAPS (Ours - Safety Optimized)
             ours = EntropyStratifiedRAPS(trained_model, cal_loader, pt_loader, alpha=0.1, k_reg=2, device=device)
             
             # Evaluate
             evaluator = ComprehensiveEvaluator(current_config, data_loader.class_names)
-            
+
             res_lac = evaluator.evaluate_method(lac, test_loader, "LAC")
+            res_aps = evaluator.evaluate_method(aps, test_loader, "APS")
+            res_raps = evaluator.evaluate_method(raps_std, test_loader, "RAPS_Standard")
             res_ours = evaluator.evaluate_method(ours, test_loader, "EntropyRAPS", compute_gradcam=False)
         
             if seed_idx == 0 and dataset_name == 'organamnist':
@@ -124,18 +146,29 @@ def main():
                 'Hard_Case_Coverage': get_hard_cov(res_lac)
             })
             dataset_results.append({
+                'Seed': seed, 'Method': 'APS',
+                'Coverage': res_aps['uncertainty']['coverage'],
+                'Avg_Set_Size': res_aps['uncertainty']['avg_set_size'],
+                'Hard_Case_Coverage': get_hard_cov(res_aps)
+            })
+            dataset_results.append({
+                'Seed': seed, 'Method': 'RAPS_Standard',
+                'Coverage': res_raps['uncertainty']['coverage'],
+                'Avg_Set_Size': res_raps['uncertainty']['avg_set_size'],
+                'Hard_Case_Coverage': get_hard_cov(res_raps)
+            })
+            dataset_results.append({
                 'Seed': seed, 'Method': 'EntropyRAPS',
                 'Coverage': res_ours['uncertainty']['coverage'],
                 'Avg_Set_Size': res_ours['uncertainty']['avg_set_size'],
                 'Hard_Case_Coverage': get_hard_cov(res_ours)
             })
             
-        # Simpan Tabel Final per Dataset
         save_paper_results(dataset_name, dataset_results, save_dir)
 
     print("\n" + "="*80)
     print("ALL EXPERIMENTS COMPLETED.")
-    print("Check 'outputs/' folder for CSV tables and Visualizations.")
+    print(f"Results saved to: {BASE_OUTPUT_DIR}")
     print("="*80)
 
 if __name__ == "__main__":

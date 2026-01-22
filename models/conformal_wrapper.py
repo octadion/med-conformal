@@ -13,43 +13,44 @@ def get_logits_labels(model, loader, device='cuda'):
             x = x.to(device)
             out = model(x)
             logits_list.append(out.cpu())
+            # Handle label dimension
+            if len(y.shape) > 1:
+                y = y.squeeze()
             labels_list.append(y.cpu())
-    return torch.cat(logits_list), torch.cat(labels_list).squeeze()
+    return torch.cat(logits_list), torch.cat(labels_list)
 
 def calculate_entropy(logits):
     probs = torch.softmax(logits, dim=1).numpy()
     return entropy(probs, axis=1)
-
 class StandardLAC(nn.Module):
     def __init__(self, model, calib_loader, alpha=0.1, device='cuda'):
         super().__init__()
         self.model = model
         self.alpha = alpha
+        self.device = device
         
-        print("Calibrating Standard LAC...")
+        print("   [LAC] Calibrating...")
         logits, labels = get_logits_labels(model, calib_loader, device)
         probs = torch.softmax(logits, dim=1)
         
         true_probs = probs[torch.arange(len(labels)), labels.long()]
         scores = 1 - true_probs
-
+        
         n = len(labels)
         q_val = np.quantile(scores.numpy(), np.ceil((n + 1) * (1 - alpha)) / n, method='higher')
         
         self.q_hat = q_val
-        print(f"LAC Threshold (1 - q_hat): {1 - self.q_hat:.4f}")
+        print(f"   [LAC] Threshold (1 - q_hat): {1 - self.q_hat:.4f}")
 
     def forward(self, x):
         with torch.no_grad():
             logits = self.model(x)
             probs = torch.softmax(logits, dim=1)
             
-            # if prob >= 1 - q_hat
             threshold = 1 - self.q_hat
             
             prediction_sets = []
             for p in probs.cpu().numpy():
-                # Get indices where prob >= threshold
                 pred_set = np.where(p >= threshold)[0]
                 if len(pred_set) == 0: 
                      pred_set = np.array([np.argmax(p)])
@@ -57,7 +58,60 @@ class StandardLAC(nn.Module):
                 
             return logits, prediction_sets
 
-class EntropyStratifiedRAPS(nn.Module):
+class StandardAPS(nn.Module):
+    def __init__(self, model, calib_loader, alpha=0.1, device='cuda'):
+        super().__init__()
+        self.model = model
+        self.alpha = alpha
+        self.device = device
+        
+        print("   [APS] Calibrating...")
+        logits, labels = get_logits_labels(model, calib_loader, device)
+        
+        scores = self._compute_aps_scores(logits, labels)
+        
+        n = len(labels)
+        self.q_hat = np.quantile(scores, np.ceil((n + 1) * (1 - alpha)) / n, method='higher')
+        print(f"   [APS] Q_hat: {self.q_hat:.4f}")
+
+    def _compute_aps_scores(self, logits, labels=None):
+        probs = torch.softmax(logits, dim=1)
+        sorted_probs, idx = torch.sort(probs, dim=1, descending=True)
+        cumsum = torch.cumsum(sorted_probs, dim=1)
+        
+        if labels is None:
+            return cumsum, idx
+            
+        # Score = Cumsum probability up to true class
+        rows = torch.arange(len(labels))
+        ranks = torch.zeros(len(labels), dtype=torch.long)
+        for i, lbl in enumerate(labels):
+            rank = (idx[i] == lbl).nonzero(as_tuple=True)[0]
+            ranks[i] = rank.item() if len(rank) > 0 else 0
+            
+        scores = cumsum[rows, ranks]
+        return scores.numpy()
+
+    def forward(self, x):
+        with torch.no_grad():
+            logits = self.model(x)
+            cumsum, idx = self._compute_aps_scores(logits)
+            
+            prediction_sets = []
+            for i in range(x.size(0)):
+                mask = cumsum[i] <= self.q_hat
+                if mask.sum() == 0:
+                    k_star = 0
+                else:
+                    k_star = mask.nonzero(as_tuple=True)[0][-1].item()
+                
+                pred_set = idx[i, :k_star+1].cpu().numpy()
+                prediction_sets.append(pred_set)
+                
+            return logits, prediction_sets
+
+
+class SizeOptimizedRAPS(nn.Module):
     def __init__(self, model, calib_loader, tune_loader, alpha=0.1, k_reg=2, device='cuda'):
         super().__init__()
         self.model = model
@@ -66,108 +120,199 @@ class EntropyStratifiedRAPS(nn.Module):
         self.device = device
         self.num_classes = model.num_classes
         
-        print("Loading Calibration & Tuning Data...")
         self.logits_cal, self.labels_cal = get_logits_labels(model, calib_loader, device)
         self.logits_tune, self.labels_tune = get_logits_labels(model, tune_loader, device)
-
-        print("Optimizing Lambda via Entropy Stratification...")
-        self.lamda_star, self.q_hat_star = self._optimize_lambda_entropy()
-        print(f"✓ Selected Lambda: {self.lamda_star:.5f} | Q_hat: {self.q_hat_star:.5f}")
+        
+        print("   [RAPS-Standard] Optimizing Lambda for Minimal Set Size...")
+        self.lamda_star, self.q_hat_star = self._optimize_lambda_size()
+        print(f"   [RAPS-Standard] Lambda: {self.lamda_star:.5f}")
 
     def _get_qhat(self, logits, labels, lamda):
         probs = torch.softmax(logits, dim=1)
-        # Sort probabilities descending
         sorted_probs, idx = torch.sort(probs, dim=1, descending=True)
         cumsum = torch.cumsum(sorted_probs, dim=1)
         
         rows = torch.arange(len(labels))
         ranks = torch.zeros(len(labels), dtype=torch.long)
         for i, lbl in enumerate(labels):
-            ranks[i] = (idx[i] == lbl).nonzero(as_tuple=True)[0].item()
+            rank = (idx[i] == lbl).nonzero(as_tuple=True)[0]
+            ranks[i] = rank.item() if len(rank) > 0 else 0
             
-        # RAPS Score: Cumsum(true_class) + Lambda * Penalty
-        # Penalty = max(0, rank - k_reg + 1)
         scores = cumsum[rows, ranks] + lamda * torch.clamp(ranks - self.k_reg + 1, min=0)
-        
         n = len(labels)
-        q = np.quantile(scores.numpy(), np.ceil((n + 1) * (1 - self.alpha)) / n, method='higher')
-        return q
+        return np.quantile(scores.numpy(), np.ceil((n + 1) * (1 - self.alpha)) / n, method='higher')
 
-    def _optimize_lambda_entropy(self):
-        tune_entropy = calculate_entropy(self.logits_tune)
-
-        th1 = np.quantile(tune_entropy, 0.33)
-        th2 = np.quantile(tune_entropy, 0.66)
-        
-        idxs_easy = np.where(tune_entropy <= th1)[0]
-        idxs_med  = np.where((tune_entropy > th1) & (tune_entropy <= th2))[0]
-        idxs_hard = np.where(tune_entropy > th2)[0]
-        
-        strata_idxs = [idxs_easy, idxs_med, idxs_hard]
-        # lambda_grid = [0.0, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1]
-        lambda_grid = np.linspace(0, 0.05, 20) # Fine-grained search
-        
-        best_lam = 0.0
-        best_q = 0.0
-        min_max_violation = float('inf')
+    def _optimize_lambda_size(self):
+        lambda_grid = np.linspace(0, 0.05, 20)
+        best_lam, best_q = 0.0, 0.0
+        min_size = float('inf')
+        target_cov = 1 - self.alpha
         
         for lam in lambda_grid:
-            q_candidate = self._get_qhat(self.logits_cal, self.labels_cal, lam)
+            q_cand = self._get_qhat(self.logits_cal, self.labels_cal, lam)
             
             probs_tune = torch.softmax(self.logits_tune, dim=1)
             sorted_probs, idx = torch.sort(probs_tune, dim=1, descending=True)
             cumsum = torch.cumsum(sorted_probs, dim=1)
             
-            covered = []
-            # Score(label) = Cumsum(label) + Penalty(label)
+            penalties = lam * torch.clamp(torch.arange(self.num_classes) - self.k_reg + 1, min=0)
+            scores_all = cumsum + penalties.unsqueeze(0)
+            sizes = (scores_all <= q_cand).sum(dim=1)
+            sizes = torch.clamp(sizes, min=1)
+            avg_size = sizes.float().mean().item()
             
             rows = torch.arange(len(self.labels_tune))
             ranks = torch.zeros(len(self.labels_tune), dtype=torch.long)
             for i, lbl in enumerate(self.labels_tune):
-                ranks[i] = (idx[i] == lbl).nonzero(as_tuple=True)[0].item()
+                 rank = (idx[i] == lbl).nonzero(as_tuple=True)[0]
+                 ranks[i] = rank.item() if len(rank) > 0 else 0
+            
+            scores_true = cumsum[rows, ranks] + lam * torch.clamp(ranks - self.k_reg + 1, min=0)
+            coverage = (scores_true <= q_cand).float().mean().item()
+            
+            if coverage >= target_cov - 0.005: 
+                if avg_size < min_size:
+                    min_size = avg_size
+                    best_lam = lam
+                    best_q = q_cand
+        
+        return best_lam, best_q
+
+    def forward(self, x):
+        return _forward_raps(self, x)
+
+class EntropyStratifiedRAPS(nn.Module):
+    def __init__(self, model, calib_loader, tune_loader, alpha=0.1, k_reg=2, device='cuda'):
+        super().__init__()
+        self.model = model
+        self.device = device
+        self.alpha = alpha
+        self.k_reg = k_reg
+        self.num_classes = model.num_classes
+        
+        self.logits_cal, self.labels_cal = get_logits_labels(model, calib_loader, device)
+        self.logits_tune, self.labels_tune = get_logits_labels(model, tune_loader, device)
+        
+        print("   [Entropy-RAPS] Optimizing Lambda for Stratified Safety...")
+        self.lamda_star, self.q_hat_star = self._optimize_lambda_entropy()
+        print(f"   [Entropy-RAPS] Lambda: {self.lamda_star:.5f}")
+
+    def _get_qhat(self, logits, labels, lamda):
+        probs = torch.softmax(logits, dim=1)
+        sorted_probs, idx = torch.sort(probs, dim=1, descending=True)
+        cumsum = torch.cumsum(sorted_probs, dim=1)
+        
+        rows = torch.arange(len(labels))
+        ranks = torch.zeros(len(labels), dtype=torch.long)
+        for i, lbl in enumerate(labels):
+            rank = (idx[i] == lbl).nonzero(as_tuple=True)[0]
+            ranks[i] = rank.item() if len(rank) > 0 else 0
+            
+        scores = cumsum[rows, ranks] + lamda * torch.clamp(ranks - self.k_reg + 1, min=0)
+        n = len(labels)
+        return np.quantile(scores.numpy(), np.ceil((n + 1) * (1 - self.alpha)) / n, method='higher')
+
+    def _optimize_lambda_entropy(self):
+        tune_entropy = calculate_entropy(self.logits_tune)
+        th1, th2 = np.quantile(tune_entropy, [0.33, 0.66])
+        
+        strata_idxs = [
+            np.where(tune_entropy <= th1)[0],
+            np.where((tune_entropy > th1) & (tune_entropy <= th2))[0],
+            np.where(tune_entropy > th2)[0]
+        ]
+        
+        lambda_grid = np.linspace(0, 0.05, 20)
+        best_lam, best_q = 0.0, 0.0
+        min_max_violation = float('inf')
+        
+        best_avg_size = float('inf')
+        
+        for lam in lambda_grid:
+            q_cand = self._get_qhat(self.logits_cal, self.labels_cal, lam)
+
+            probs_tune = torch.softmax(self.logits_tune, dim=1)
+            sorted_probs, idx = torch.sort(probs_tune, dim=1, descending=True)
+            cumsum = torch.cumsum(sorted_probs, dim=1)
+            rows = torch.arange(len(self.labels_tune))
+            ranks = torch.zeros(len(self.labels_tune), dtype=torch.long)
+            for i, lbl in enumerate(self.labels_tune):
+                 rank = (idx[i] == lbl).nonzero(as_tuple=True)[0]
+                 ranks[i] = rank.item() if len(rank) > 0 else 0
             
             scores_tune = cumsum[rows, ranks] + lam * torch.clamp(ranks - self.k_reg + 1, min=0)
-            is_covered = (scores_tune <= q_candidate).numpy().astype(int)
+            is_covered = (scores_tune <= q_cand).numpy().astype(int)
             
+            penalties = lam * torch.clamp(torch.arange(self.num_classes) - self.k_reg + 1, min=0)
+            scores_all = cumsum + penalties.unsqueeze(0)
+            sizes = (scores_all <= q_cand).sum(dim=1)
+            curr_avg_size = sizes.float().mean().item()
+
             violations = []
-            for stratum_idx in strata_idxs:
-                if len(stratum_idx) == 0: continue
-                cov_strat = np.mean(is_covered[stratum_idx])
-                violations.append(abs(cov_strat - (1 - self.alpha)))
-            
+            for s_idx in strata_idxs:
+                if len(s_idx) == 0: continue
+                cov = np.mean(is_covered[s_idx])
+                violations.append(abs(cov - (1 - self.alpha)))
             max_viol = max(violations) if violations else 1.0
-            
+
             if max_viol < min_max_violation:
                 min_max_violation = max_viol
                 best_lam = lam
-                best_q = q_candidate
+                best_q = q_cand
+                best_avg_size = curr_avg_size
+            elif abs(max_viol - min_max_violation) < 0.001:
+                if curr_avg_size < best_avg_size:
+                    min_max_violation = max_viol
+                    best_lam = lam
+                    best_q = q_cand
+                    best_avg_size = curr_avg_size
                 
         return best_lam, best_q
 
     def forward(self, x):
-        with torch.no_grad():
-            logits = self.model(x)
-            probs = torch.softmax(logits, dim=1)
-            sorted_probs, idx = torch.sort(probs, dim=1, descending=True)
-            cumsum = torch.cumsum(sorted_probs, dim=1)
+        return _forward_raps(self, x)
+
+def _forward_raps(self, x):
+    with torch.no_grad():
+        logits = self.model(x)
+        probs = torch.softmax(logits, dim=1)
+        sorted_probs, idx = torch.sort(probs, dim=1, descending=True)
+        cumsum = torch.cumsum(sorted_probs, dim=1)
+        
+        prediction_sets = []
+        for i in range(x.size(0)):
+            penalties = self.lamda_star * torch.clamp(torch.arange(self.num_classes, device=x.device) - self.k_reg + 1, min=0)
+            scores = cumsum[i] + penalties
             
-            prediction_sets = []
-            for i in range(x.size(0)):
-                # Construct Set: Include k until score > Q_hat
-                # Optimization: Find cut-off k
-                # Score[k] = cumsum[k] + lambda * max(0, k - kreg + 1)
+            mask = scores <= self.q_hat_star
+            if mask.sum() == 0: k_star = 0
+            else: k_star = mask.nonzero()[-1].item()
                 
-                penalties = self.lamda_star * torch.clamp(torch.arange(self.num_classes, device=x.device) - self.k_reg + 1, min=0)
-                scores = cumsum[i] + penalties
-                
-                mask = scores <= self.q_hat_star
-                
-                if mask.sum() == 0:
-                    k_star = 0 
-                else:
-                    k_star = mask.nonzero()[-1].item()
-                    
-                pred_set = idx[i, :k_star+1].cpu().numpy()
-                prediction_sets.append(pred_set)
-                
-            return logits, prediction_sets
+            pred_set = idx[i, :k_star+1].cpu().numpy()
+            prediction_sets.append(pred_set)
+            
+        return logits, prediction_sets
+
+def predict_with_sets(conformal_model, dataloader):
+    """
+    REQUIRED by evaluator.py.
+    """
+    device = getattr(conformal_model, 'device', 'cuda')
+    conformal_model.eval()
+    all_logits, all_preds, all_probs, all_sets, all_labels = [], [], [], [], []
+
+    with torch.no_grad():
+        for x, y in dataloader:
+            x = x.to(device)
+            logits, sets = conformal_model(x)
+            probs = torch.softmax(logits, dim=1)
+            preds = torch.argmax(logits, dim=1)
+
+            all_logits.append(logits.cpu().numpy())
+            all_probs.append(probs.cpu().numpy())
+            all_preds.append(preds.cpu().numpy())
+            if len(y.shape) > 1: y = y.squeeze()
+            all_labels.append(y.cpu().numpy())
+            all_sets.extend(sets)
+
+    return np.concatenate(all_logits), np.concatenate(all_preds), np.concatenate(all_probs), all_sets, np.concatenate(all_labels)
