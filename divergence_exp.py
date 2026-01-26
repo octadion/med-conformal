@@ -6,33 +6,13 @@ sys.path.append('.')
 
 from data.dataloader import MedMNISTDataLoader
 from models.base_model import get_model
-from models.conformal_wrapper import SizeOptimizedRAPS, EntropyStratifiedRAPS, MondrianCP
+from models.conformal_wrapper import SizeOptimizedRAPS, EntropyStratifiedRAPS, predict_with_sets
 from training.trainer import Trainer
 import numpy as np
 from scipy.stats import entropy
+from torch.utils.data import Subset
 
 class ImbalancedDifficultyDataset:
-    """
-    Create imbalanced difficulty distribution from existing dataset.
-    
-    Strategy:
-    1. Compute entropy for all samples (using trained model)
-    2. Define difficulty strata (tertiles)
-    3. Subsample to create imbalance:
-       - Easy: Keep 80-90%
-       - Medium: Keep 15-20%
-       - Hard: Keep 5-10%
-    
-    Args:
-        base_dataset: Original dataset (e.g., PathMNIST validation set)
-        model: Trained model (to compute entropy)
-        hard_ratio: Fraction of hard cases to keep (default 0.1)
-        medium_ratio: Fraction of medium cases to keep (default 0.2)
-        easy_ratio: Fraction of easy cases to keep (default 0.9)
-        device: 'cuda' or 'cpu'
-        seed: Random seed for reproducibility
-    """
-    
     def __init__(self, base_dataset, model, 
                  hard_ratio=0.1, medium_ratio=0.2, easy_ratio=0.9,
                  device='cuda', seed=42):
@@ -44,14 +24,11 @@ class ImbalancedDifficultyDataset:
         print(f"[Imbalanced Dataset] Creating difficulty imbalance...")
         print(f"   Target ratios - Easy: {easy_ratio:.0%}, Medium: {medium_ratio:.0%}, Hard: {hard_ratio:.0%}")
         
-        # Set seed for reproducibility
         np.random.seed(seed)
         torch.manual_seed(seed)
         
-        # Step 1: Compute entropy for all samples
         entropies = self._compute_entropy_for_dataset()
         
-        # Step 2: Define strata
         t1, t2 = np.quantile(entropies, [0.33, 0.66])
         
         easy_mask = entropies <= t1
@@ -64,7 +41,6 @@ class ImbalancedDifficultyDataset:
         
         print(f"   Original counts - Easy: {len(easy_indices)}, Medium: {len(medium_indices)}, Hard: {len(hard_indices)}")
         
-        # Step 3: Subsample each stratum
         n_easy = int(len(easy_indices) * easy_ratio)
         n_medium = int(len(medium_indices) * medium_ratio)
         n_hard = int(len(hard_indices) * hard_ratio)
@@ -73,11 +49,9 @@ class ImbalancedDifficultyDataset:
         selected_medium = np.random.choice(medium_indices, n_medium, replace=False)
         selected_hard = np.random.choice(hard_indices, n_hard, replace=False)
         
-        # Combine and shuffle
         self.selected_indices = np.concatenate([selected_easy, selected_medium, selected_hard])
         np.random.shuffle(self.selected_indices)
         
-        # Store strata information for analysis
         self.easy_mask_new = np.isin(self.selected_indices, selected_easy)
         self.medium_mask_new = np.isin(self.selected_indices, selected_medium)
         self.hard_mask_new = np.isin(self.selected_indices, selected_hard)
@@ -88,11 +62,9 @@ class ImbalancedDifficultyDataset:
               f"Hard: {n_hard/(n_easy+n_medium+n_hard):.1%}")
     
     def _compute_entropy_for_dataset(self):
-        """Compute entropy for all samples in dataset."""
         self.model.eval()
         entropies = []
         
-        # Create temporary loader
         loader = torch.utils.data.DataLoader(
             self.base_dataset, 
             batch_size=128, 
@@ -111,11 +83,9 @@ class ImbalancedDifficultyDataset:
         return np.array(entropies)
     
     def get_subset(self):
-        """Return PyTorch Subset with selected indices."""
         return Subset(self.base_dataset, self.selected_indices)
     
     def get_stratum_info(self):
-        """Return dictionary with stratum information for analysis."""
         return {
             'easy_indices': np.where(self.easy_mask_new)[0],
             'medium_indices': np.where(self.medium_mask_new)[0],
@@ -126,55 +96,6 @@ class ImbalancedDifficultyDataset:
         }
 
 
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
-
-def create_imbalanced_splits(dataset, model, config, device='cuda'):
-    """
-    High-level wrapper to create imbalanced cal/tune/test splits.
-    
-    Usage in main.py:
-        if args.imbalanced:
-            val_dataset, test_dataset = create_imbalanced_splits(
-                dataset, model, config, device
-            )
-    
-    Returns:
-        imbalanced_val: Imbalanced validation set (for cal/tune split)
-        imbalanced_test: Imbalanced test set
-        strata_info: Dict with stratum information
-    """
-    
-    # Create imbalanced version of validation set
-    print("\n[Creating Imbalanced Validation Set]")
-    imb_val = ImbalancedDifficultyDataset(
-        dataset.val_dataset,
-        model,
-        hard_ratio=0.1,   # Only 10% of hard cases
-        medium_ratio=0.2, # 20% of medium
-        easy_ratio=0.9,   # 90% of easy
-        device=device,
-        seed=config.get('seed', 42)
-    )
-    
-    # Create imbalanced version of test set
-    print("\n[Creating Imbalanced Test Set]")
-    imb_test = ImbalancedDifficultyDataset(
-        dataset.test_dataset,
-        model,
-        hard_ratio=0.1,
-        medium_ratio=0.2,
-        easy_ratio=0.9,
-        device=device,
-        seed=config.get('seed', 42) + 1  # Different seed for test
-    )
-    
-    return imb_val.get_subset(), imb_test.get_subset(), {
-        'val_strata': imb_val.get_stratum_info(),
-        'test_strata': imb_test.get_stratum_info()
-    }
-
 def main():
     config_path = Path('configs/config.yaml')
     with open(config_path, 'r') as f:
@@ -184,25 +105,42 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     # Load data
+    print("[1/3] Loading data...")
     data_loader = MedMNISTDataLoader(config)
     train_loader, val_loader, test_loader = data_loader.load_data()
     
-    # Train model
-    print("[1/4] Training model...")
+    print("[2/3] Loading trained model...")
     model = get_model(config, device)
-    trainer = Trainer(model, config, device)
-    trained_model = trainer.train(train_loader, val_loader, None)
+
+    checkpoint_path = Path('/content/drive/MyDrive/MedConformal_Final_Submission2/pathmnist_final/models/pathmnist_exp_20260122_153413_best_model.pth')
+    
+    if checkpoint_path.exists():
+        print(f"   Loading from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print("   ✅ Model loaded successfully!")
+    else:
+        print("   ⚠️ Checkpoint not found, training new model...")
+        from lib_utils.logger import ExperimentLogger
+        save_dir = Path('divergence_results')
+        save_dir.mkdir(parents=True, exist_ok=True)
+        logger = ExperimentLogger(str(save_dir), 'divergence_exp')
+        
+        trainer = Trainer(model, config, device)
+        model = trainer.train(train_loader, val_loader, logger)
+    
+    trained_model = model
     
     # Create IMBALANCED dataset
-    print("[2/4] Creating imbalanced difficulty dataset...")
+    print("\n[3/3] Creating imbalanced difficulty dataset...")
     imb_val = ImbalancedDifficultyDataset(
         val_loader.dataset, trained_model,
-        hard_ratio=0.1, medium_ratio=0.2, easy_ratio=0.9,
+        hard_ratio=0.05, medium_ratio=0.1, easy_ratio=0.95,
         device=device, seed=42
     )
     imb_test = ImbalancedDifficultyDataset(
         test_loader.dataset, trained_model,
-        hard_ratio=0.1, medium_ratio=0.2, easy_ratio=0.9,
+        hard_ratio=0.05, medium_ratio=0.1, easy_ratio=0.95,
         device=device, seed=43
     )
     
@@ -217,7 +155,7 @@ def main():
     test_imb_loader = torch.utils.data.DataLoader(imb_test.get_subset(), batch_size=32, shuffle=False)
     
     # Run methods
-    print("[3/4] Running conformal methods...")
+    print("\n[4/4] Running conformal methods...")
     raps = SizeOptimizedRAPS(trained_model, cal_loader, tune_loader, alpha=0.1, k_reg=2, device=device)
     entropy_raps = EntropyStratifiedRAPS(trained_model, cal_loader, tune_loader, alpha=0.1, k_reg=2, device=device)
     
@@ -234,16 +172,17 @@ def main():
         print("\n⚠️ No divergence (try more extreme imbalance)")
     
     # Evaluate coverage
-    print("\n[4/4] Evaluating coverage...")
-    from models.conformal_wrapper import predict_with_sets
+    print("\n[5/5] Evaluating coverage...")
     
     # RAPS
     _, _, probs_raps, sets_raps, labels = predict_with_sets(raps, test_imb_loader)
     cov_raps = np.mean([labels[i] in sets_raps[i] for i in range(len(labels))])
+    size_raps = np.mean([len(sets_raps[i]) for i in range(len(labels))])
     
     # EntropyRAPS
     _, _, probs_ent, sets_ent, labels = predict_with_sets(entropy_raps, test_imb_loader)
     cov_ent = np.mean([labels[i] in sets_ent[i] for i in range(len(labels))])
+    size_ent = np.mean([len(sets_ent[i]) for i in range(len(labels))])
     
     # Hard-case coverage
     ent_vals = entropy(probs_raps, axis=1)
@@ -252,10 +191,19 @@ def main():
     hard_cov_raps = np.mean([labels[i] in sets_raps[i] for i in range(len(labels)) if hard_mask[i]])
     hard_cov_ent = np.mean([labels[i] in sets_ent[i] for i in range(len(labels)) if hard_mask[i]])
     
-    print(f"\nStandard RAPS: Overall={cov_raps:.1%}, Hard={hard_cov_raps:.1%}")
-    print(f"EntropyRAPS: Overall={cov_ent:.1%}, Hard={hard_cov_ent:.1%}")
+    print(f"\nStandard RAPS:")
+    print(f"  Overall Coverage: {cov_raps:.1%}")
+    print(f"  Hard Coverage:    {hard_cov_raps:.1%}")
+    print(f"  Avg Set Size:     {size_raps:.2f}")
     
-    print("\n✅ Divergence experiment complete!")
+    print(f"\nEntropyRAPS:")
+    print(f"  Overall Coverage: {cov_ent:.1%}")
+    print(f"  Hard Coverage:    {hard_cov_ent:.1%}")
+    print(f"  Avg Set Size:     {size_ent:.2f}")
+    
+    print("\n" + "="*60)
+    print("✅ Divergence experiment complete!")
+    print("="*60)
 
 if __name__ == "__main__":
     main()
