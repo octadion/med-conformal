@@ -188,6 +188,57 @@ class MedMNISTDataLoader:
         
         return paramtune_dataset, calib_dataset
     
+    def split_validation_3way(self, val_dataset,
+                             pct_tune: float = 0.3,
+                             pct_calib: float = 0.4,
+                             pct_val: float = 0.3) -> Tuple[Subset, Subset, Subset]:
+        """
+        ✨ NEW: Three-way split for proper conformal prediction.
+        
+        This fixes the split protocol violation by separating:
+        1. Tune set: Define entropy boundaries and scan lambda candidates
+        2. Calib set: Compute quantiles for each lambda
+        3. Val set: Select best lambda based on stratified coverage
+        
+        Args:
+            val_dataset: Full validation dataset
+            pct_tune: Percentage for tuning (entropy boundaries, lambda scan)
+            pct_calib: Percentage for calibration (quantile computation)
+            pct_val: Percentage for validation (lambda selection)
+            
+        Returns:
+            Tuple of (tune_dataset, calib_dataset, val_dataset)
+        """
+        assert abs(pct_tune + pct_calib + pct_val - 1.0) < 1e-6, \
+            f"Percentages must sum to 1.0, got {pct_tune + pct_calib + pct_val}"
+        
+        n_total = len(val_dataset)
+        n_tune = int(n_total * pct_tune)
+        n_calib = int(n_total * pct_calib)
+        n_val = n_total - n_tune - n_calib  # Remaining samples
+        
+        # Random permutation for splitting
+        indices = np.random.permutation(n_total)
+        
+        tune_indices = indices[:n_tune]
+        calib_indices = indices[n_tune:n_tune+n_calib]
+        val_indices = indices[n_tune+n_calib:]
+        
+        tune_dataset = Subset(val_dataset, tune_indices)
+        calib_dataset = Subset(val_dataset, calib_indices)
+        val_dataset_split = Subset(val_dataset, val_indices)
+        
+        print(f"\n{'='*60}")
+        print("3-WAY SPLIT FOR CONFORMAL PREDICTION")
+        print(f"{'='*60}")
+        print(f"  Tune set (entropy boundaries):  {len(tune_dataset):>6} ({pct_tune:.1%})")
+        print(f"  Calib set (quantile computation): {len(calib_dataset):>6} ({pct_calib:.1%})")
+        print(f"  Val set (lambda selection):      {len(val_dataset_split):>6} ({pct_val:.1%})")
+        print(f"  Total:                           {n_total:>6}")
+        print(f"{'='*60}\n")
+        
+        return tune_dataset, calib_dataset, val_dataset_split
+    
     def get_class_weights(self, dataset) -> torch.Tensor:
         """
         Compute class weights for imbalanced datasets.
