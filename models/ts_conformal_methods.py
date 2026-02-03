@@ -1,10 +1,12 @@
 """
-Temperature-Scaled Conformal Prediction Methods
+Temperature-Scaled Conformal Prediction Methods (FIXED)
 
 This module provides temperature-scaled variants of conformal prediction methods.
 Temperature scaling improves probability calibration before computing prediction sets.
 
 Baseline comparison requested by Stanford reviewer (Point #3).
+
+FIXED: Uses randomized calibration scores matching original RAPS paper.
 """
 
 import torch
@@ -17,7 +19,6 @@ from typing import List, Tuple
 import sys
 sys.path.append('.')
 from models.temperature_scaling import TemperatureScaler
-from models.randomization_utils import compute_randomized_quantile
 
 
 def get_logits_labels(model, loader, device='cuda'):
@@ -42,35 +43,145 @@ def calculate_entropy(logits, temperature=1.0):
     return entropy(probs, axis=1)
 
 
+# =============================================================================
+# FIXED SCORE COMPUTATION WITH RANDOMIZATION
+# =============================================================================
+
+def compute_aps_scores_randomized(logits: torch.Tensor, 
+                                   labels: torch.Tensor, 
+                                   temperature: float = 1.0,
+                                   randomized: bool = True) -> np.ndarray:
+    """
+    Compute APS conformity scores WITH randomization (matching original paper).
+    
+    FIXED: score = U * p_y + cumsum[rank-1] instead of cumsum[rank]
+    """
+    probs = torch.softmax(logits / temperature, dim=1)
+    sorted_probs, indices = torch.sort(probs, dim=1, descending=True)
+    cumsum = torch.cumsum(sorted_probs, dim=1)
+    
+    n_samples = len(labels)
+    scores = np.zeros(n_samples)
+    
+    for i in range(n_samples):
+        rank_tensor = (indices[i] == labels[i]).nonzero(as_tuple=True)[0]
+        rank = rank_tensor.item() if len(rank_tensor) > 0 else 0
+        
+        p_y = sorted_probs[i, rank].item()
+        U = np.random.random() if randomized else 1.0
+        
+        if rank == 0:
+            scores[i] = U * p_y
+        else:
+            cumsum_before = cumsum[i, rank - 1].item()
+            scores[i] = U * p_y + cumsum_before
+    
+    return scores
+
+
+def compute_raps_scores_randomized(logits: torch.Tensor, 
+                                    labels: torch.Tensor,
+                                    lamda: float,
+                                    k_reg: int,
+                                    temperature: float = 1.0,
+                                    randomized: bool = True) -> np.ndarray:
+    """
+    Compute RAPS conformity scores WITH randomization (matching original paper).
+    
+    FIXED: score = U * p_y + cumsum[rank-1] + penalty
+    """
+    probs = torch.softmax(logits / temperature, dim=1)
+    sorted_probs, indices = torch.sort(probs, dim=1, descending=True)
+    cumsum = torch.cumsum(sorted_probs, dim=1)
+    
+    n_samples = len(labels)
+    scores = np.zeros(n_samples)
+    
+    for i in range(n_samples):
+        rank_tensor = (indices[i] == labels[i]).nonzero(as_tuple=True)[0]
+        rank = rank_tensor.item() if len(rank_tensor) > 0 else 0
+        
+        p_y = sorted_probs[i, rank].item()
+        penalty = lamda * max(rank - k_reg + 1, 0)
+        U = np.random.random() if randomized else 1.0
+        
+        if rank == 0:
+            scores[i] = U * p_y + penalty
+        else:
+            cumsum_before = cumsum[i, rank - 1].item()
+            scores[i] = U * p_y + cumsum_before + penalty
+    
+    return scores
+
+
+def compute_quantile(scores: np.ndarray, alpha: float) -> float:
+    """Compute conformal quantile (matching original paper)."""
+    return np.quantile(scores, 1 - alpha, method='higher')
+
+
+def construct_prediction_sets_gcq(probs: np.ndarray, 
+                                   q_hat: float,
+                                   lamda: float = 0.0,
+                                   k_reg: int = 2,
+                                   randomized: bool = True,
+                                   allow_zero_sets: bool = False) -> List[np.ndarray]:
+    """
+    Construct prediction sets using Generalized Conditional Quantile (gcq).
+    EXACT algorithm from original conformal.py.
+    """
+    n_samples, n_classes = probs.shape
+    
+    I = probs.argsort(axis=1)[:, ::-1]
+    ordered = np.sort(probs, axis=1)[:, ::-1]
+    cumsum = np.cumsum(ordered, axis=1)
+    
+    # Flat penalty after k_reg (like original)
+    penalties = np.zeros(n_classes)
+    penalties[k_reg:] = lamda
+    penalties_cumsum = np.cumsum(penalties)
+    
+    sizes_base = ((cumsum + penalties_cumsum) <= q_hat).sum(axis=1) + 1
+    sizes_base = np.minimum(sizes_base, n_classes)
+    
+    if randomized:
+        V = np.zeros(n_samples)
+        for i in range(n_samples):
+            idx = sizes_base[i] - 1
+            if idx >= 0 and ordered[i, idx] > 1e-10:
+                score_without_last = (cumsum[i, idx] - ordered[i, idx]) + penalties_cumsum[idx]
+                V[i] = (q_hat - score_without_last) / ordered[i, idx]
+                V[i] = np.clip(V[i], 0.0, 1.0)
+        
+        sizes = sizes_base - (np.random.random(n_samples) >= V).astype(int)
+    else:
+        sizes = sizes_base
+    
+    if q_hat >= 1.0:
+        sizes[:] = n_classes
+    
+    if not allow_zero_sets:
+        sizes = np.maximum(sizes, 1)
+    
+    return [I[i, :sizes[i]] for i in range(n_samples)]
+
+
 # ============================================================================
-# TEMPERATURE-SCALED APS
+# TEMPERATURE-SCALED APS (FIXED)
 # ============================================================================
 
 class TemperatureScaledAPS(nn.Module):
     """
-    APS with temperature scaling.
+    APS with temperature scaling (FIXED).
     
-    Protocol:
-    1. Calibrate temperature T on calibration set
-    2. Apply APS with temperature-scaled probabilities
-    
-    This baseline requested by Stanford reviewer to compare with
-    entropy stratification approach.
+    FIXED: Uses randomized calibration scores matching original paper.
     """
     
     def __init__(self, model, calib_loader, alpha=0.1, 
-                 ts_max_iters=50, device='cuda'):
-        """
-        Args:
-            model: Trained classifier
-            calib_loader: Calibration data
-            alpha: Miscoverage level
-            ts_max_iters: Temperature scaling iterations
-            device: cuda or cpu
-        """
+                 ts_max_iters=50, randomized=True, device='cuda'):
         super().__init__()
         self.model = model
         self.alpha = alpha
+        self.randomized = randomized
         self.device = device
         
         print("   [TS-APS] Step 1: Calibrating temperature...")
@@ -83,97 +194,57 @@ class TemperatureScaledAPS(nn.Module):
         self.temperature = self.temp_scaler.temperature
         
         print(f"   [TS-APS] Optimal T = {self.temperature:.4f}")
-        print("   [TS-APS] Step 2: Computing APS quantile with scaled probabilities...")
+        print("   [TS-APS] Step 2: Computing APS quantile...")
         
-        # Compute APS quantile with temperature-scaled logits
+        # FIXED: Use randomized calibration scores
         logits, labels = get_logits_labels(model, calib_loader, device)
-        scores = self._compute_aps_scores(logits, labels, self.temperature)
-        
-        n = len(labels)
-        self.q_hat = np.quantile(
-            scores, 
-            np.ceil((n + 1) * (1 - alpha)) / n, 
-            method='higher'
+        scores = compute_aps_scores_randomized(
+            logits, labels, self.temperature, randomized=randomized
         )
         
+        self.q_hat = compute_quantile(scores, alpha)
+        
+        print(f"   [TS-APS] Score range: [{scores.min():.4f}, {scores.max():.4f}]")
         print(f"   [TS-APS] Q_hat: {self.q_hat:.4f}")
     
-    def _compute_aps_scores(self, logits, labels, temperature):
-        """Compute APS scores with temperature-scaled probabilities."""
-        probs = torch.softmax(logits / temperature, dim=1)
-        sorted_probs, idx = torch.sort(probs, dim=1, descending=True)
-        cumsum = torch.cumsum(sorted_probs, dim=1)
-        
-        rows = torch.arange(len(labels))
-        ranks = torch.zeros(len(labels), dtype=torch.long)
-        for i, lbl in enumerate(labels):
-            rank = (idx[i] == lbl).nonzero(as_tuple=True)[0]
-            ranks[i] = rank.item() if len(rank) > 0 else 0
-        
-        scores = cumsum[rows, ranks]
-        return scores.numpy()
-    
     def forward(self, x):
-        """Forward pass with temperature-scaled probabilities."""
+        """Forward pass with FIXED prediction set construction."""
         with torch.no_grad():
             logits = self.model(x)
+            probs = torch.softmax(logits / self.temperature, dim=1).cpu().numpy()
             
-            # Apply temperature scaling
-            probs = torch.softmax(logits / self.temperature, dim=1)
-            sorted_probs, idx = torch.sort(probs, dim=1, descending=True)
-            cumsum = torch.cumsum(sorted_probs, dim=1)
-            
-            prediction_sets = []
-            for i in range(x.size(0)):
-                mask = cumsum[i] <= self.q_hat
-                if mask.sum() == 0:
-                    k_star = 0
-                else:
-                    k_star = mask.nonzero(as_tuple=True)[0][-1].item()
-                
-                pred_set = idx[i, :k_star+1].cpu().numpy()
-                prediction_sets.append(pred_set)
+            prediction_sets = construct_prediction_sets_gcq(
+                probs, self.q_hat,
+                lamda=0.0, k_reg=2,
+                randomized=self.randomized, allow_zero_sets=False
+            )
             
             return logits, prediction_sets
 
 
 # ============================================================================
-# TEMPERATURE-SCALED RAPS (Size Optimized)
+# TEMPERATURE-SCALED RAPS (Size Optimized) (FIXED)
 # ============================================================================
 
 class TemperatureScaledRAPS(nn.Module):
     """
-    Size-optimized RAPS with temperature scaling.
+    Size-optimized RAPS with temperature scaling (FIXED).
     
-    Protocol:
-    1. Calibrate temperature T
-    2. Select λ to minimize average set size (with T-scaled probabilities)
-    3. Apply RAPS with selected λ and T
+    FIXED: Uses randomized calibration scores matching original paper.
     """
     
     def __init__(self, model, tune_loader, calib_loader, val_loader,
-                 alpha=0.1, k_reg=2, ts_max_iters=50, device='cuda'):
-        """
-        Args:
-            model: Trained classifier
-            tune_loader: Unused (kept for API consistency)
-            calib_loader: For temperature + quantile calibration
-            val_loader: For lambda selection
-            alpha: Miscoverage level
-            k_reg: RAPS regularization starting point
-            ts_max_iters: Temperature scaling iterations
-            device: cuda or cpu
-        """
+                 alpha=0.1, k_reg=2, ts_max_iters=50, randomized=True, device='cuda'):
         super().__init__()
         self.model = model
         self.alpha = alpha
         self.k_reg = k_reg
+        self.randomized = randomized
         self.device = device
         self.num_classes = model.num_classes
         
         print("   [TS-RAPS] Step 1: Calibrating temperature...")
         
-        # Calibrate temperature on calibration set
         self.temp_scaler = TemperatureScaler(
             model, calib_loader, device=device,
             max_iters=ts_max_iters, verbose=False
@@ -186,148 +257,92 @@ class TemperatureScaledRAPS(nn.Module):
         self.logits_cal, self.labels_cal = get_logits_labels(model, calib_loader, device)
         self.logits_val, self.labels_val = get_logits_labels(model, val_loader, device)
         
-        print("   [TS-RAPS] Step 2: Optimizing lambda for minimal set size...")
+        print("   [TS-RAPS] Step 2: Optimizing lambda...")
         self.lamda_star, self.q_hat_star = self._optimize_lambda_size()
-        print(f"   [TS-RAPS] Lambda: {self.lamda_star:.5f}")
+        print(f"   [TS-RAPS] λ*={self.lamda_star:.5f}, q_hat={self.q_hat_star:.4f}")
     
     def _get_qhat(self, logits, labels, lamda):
-        """Compute RAPS quantile with temperature-scaled probabilities."""
-        probs = torch.softmax(logits / self.temperature, dim=1)
-        sorted_probs, idx = torch.sort(probs, dim=1, descending=True)
-        cumsum = torch.cumsum(sorted_probs, dim=1)
-        
-        rows = torch.arange(len(labels))
-        ranks = torch.zeros(len(labels), dtype=torch.long)
-        for i, lbl in enumerate(labels):
-            rank = (idx[i] == lbl).nonzero(as_tuple=True)[0]
-            ranks[i] = rank.item() if len(rank) > 0 else 0
-        
-        scores = cumsum[rows, ranks] + lamda * torch.clamp(ranks - self.k_reg + 1, min=0)
-        n = len(labels)
-        return np.quantile(
-            scores.numpy(), 
-            np.ceil((n + 1) * (1 - self.alpha)) / n, 
-            method='higher'
+        """Compute RAPS quantile (FIXED with randomization)."""
+        scores = compute_raps_scores_randomized(
+            logits, labels, lamda, self.k_reg,
+            self.temperature, randomized=self.randomized
         )
+        return compute_quantile(scores, self.alpha)
     
     def _optimize_lambda_size(self):
-        """Select lambda to minimize average set size."""
-        lambda_grid = np.linspace(0, 0.05, 20)
+        """Select lambda for minimum set size."""
+        lambda_grid = np.linspace(0, 0.1, 30)
         best_lam, best_q = 0.0, 0.0
         min_size = float('inf')
         target_cov = 1 - self.alpha
         
         for lam in lambda_grid:
-            # Compute quantile on calibration set
             q_cand = self._get_qhat(self.logits_cal, self.labels_cal, lam)
             
-            # Evaluate on validation set with temperature scaling
-            probs_val = torch.softmax(self.logits_val / self.temperature, dim=1)
-            sorted_probs, idx = torch.sort(probs_val, dim=1, descending=True)
-            cumsum = torch.cumsum(sorted_probs, dim=1)
+            # Evaluate on val set
+            probs_val = torch.softmax(self.logits_val / self.temperature, dim=1).cpu().numpy()
             
-            # Compute sizes
-            penalties = lam * torch.clamp(
-                torch.arange(self.num_classes) - self.k_reg + 1, min=0
+            pred_sets = construct_prediction_sets_gcq(
+                probs_val, q_cand, lam, self.k_reg,
+                randomized=self.randomized, allow_zero_sets=False
             )
-            scores_all = cumsum + penalties.unsqueeze(0)
-            sizes = (scores_all <= q_cand).sum(dim=1)
-            sizes = torch.clamp(sizes, min=1)
-            avg_size = sizes.float().mean().item()
             
-            # Check coverage
-            rows = torch.arange(len(self.labels_val))
-            ranks = torch.zeros(len(self.labels_val), dtype=torch.long)
-            for i, lbl in enumerate(self.labels_val):
-                rank = (idx[i] == lbl).nonzero(as_tuple=True)[0]
-                ranks[i] = rank.item() if len(rank) > 0 else 0
+            coverage = np.mean([
+                self.labels_val[i].item() in pred_sets[i]
+                for i in range(len(self.labels_val))
+            ])
+            avg_size = np.mean([len(s) for s in pred_sets])
             
-            scores_true = cumsum[rows, ranks] + lam * torch.clamp(
-                ranks - self.k_reg + 1, min=0
-            )
-            coverage = (scores_true <= q_cand).float().mean().item()
-            
-            # Select lambda with smallest size (if coverage adequate)
-            if coverage >= target_cov - 0.005:
+            if coverage >= target_cov - 0.02:
                 if avg_size < min_size:
                     min_size = avg_size
                     best_lam = lam
                     best_q = q_cand
         
+        if best_q == 0.0:
+            best_lam = 0.0
+            best_q = self._get_qhat(self.logits_cal, self.labels_cal, 0.0)
+        
         return best_lam, best_q
     
     def forward(self, x):
-        """Forward pass with temperature-scaled RAPS."""
+        """Forward pass with FIXED prediction set construction."""
         with torch.no_grad():
             logits = self.model(x)
+            probs = torch.softmax(logits / self.temperature, dim=1).cpu().numpy()
             
-            # Apply temperature scaling
-            probs = torch.softmax(logits / self.temperature, dim=1)
-            sorted_probs, idx = torch.sort(probs, dim=1, descending=True)
-            cumsum = torch.cumsum(sorted_probs, dim=1)
-            
-            prediction_sets = []
-            for i in range(x.size(0)):
-                penalties = self.lamda_star * torch.clamp(
-                    torch.arange(self.num_classes, device=x.device) - self.k_reg + 1,
-                    min=0
-                )
-                scores = cumsum[i] + penalties
-                
-                mask = scores <= self.q_hat_star
-                if mask.sum() == 0:
-                    k_star = 0
-                else:
-                    k_star = mask.nonzero()[-1].item()
-                
-                pred_set = idx[i, :k_star+1].cpu().numpy()
-                prediction_sets.append(pred_set)
+            prediction_sets = construct_prediction_sets_gcq(
+                probs, self.q_hat_star,
+                lamda=self.lamda_star, k_reg=self.k_reg,
+                randomized=self.randomized, allow_zero_sets=False
+            )
             
             return logits, prediction_sets
 
 
 # ============================================================================
-# TEMPERATURE-SCALED ENTROPY-RAPS (Ours + TS)
+# TEMPERATURE-SCALED ENTROPY-RAPS (Ours + TS) (FIXED)
 # ============================================================================
 
 class TemperatureScaledEntropyRAPS(nn.Module):
     """
-    Entropy-stratified RAPS with temperature scaling.
+    Entropy-stratified RAPS with temperature scaling (FIXED).
     
-    This combines two orthogonal improvements:
-    1. Temperature scaling for better calibration
-    2. Entropy stratification for worst-case protection
-    
-    Protocol:
-    1. Calibrate temperature T on calibration set
-    2. Define entropy boundaries on tune set (with T-scaled probabilities)
-    3. Select λ via minimax over strata (with T-scaled probabilities)
-    4. Apply RAPS with selected λ and T
+    FIXED: Uses randomized calibration scores matching original paper.
     """
     
     def __init__(self, model, tune_loader, calib_loader, val_loader,
-                 alpha=0.1, k_reg=2, ts_max_iters=50, device='cuda'):
-        """
-        Args:
-            model: Trained classifier
-            tune_loader: Define entropy boundaries
-            calib_loader: Temperature + quantile calibration
-            val_loader: Lambda selection via minimax
-            alpha: Miscoverage level
-            k_reg: RAPS regularization
-            ts_max_iters: Temperature scaling iterations
-            device: cuda or cpu
-        """
+                 alpha=0.1, k_reg=2, ts_max_iters=50, randomized=True, device='cuda'):
         super().__init__()
         self.model = model
         self.alpha = alpha
         self.k_reg = k_reg
+        self.randomized = randomized
         self.device = device
         self.num_classes = model.num_classes
         
         print("   [TS-EntropyRAPS] Step 1: Calibrating temperature...")
         
-        # Calibrate temperature
         self.temp_scaler = TemperatureScaler(
             model, calib_loader, device=device,
             max_iters=ts_max_iters, verbose=False
@@ -341,39 +356,27 @@ class TemperatureScaledEntropyRAPS(nn.Module):
         self.logits_cal, self.labels_cal = get_logits_labels(model, calib_loader, device)
         self.logits_val, self.labels_val = get_logits_labels(model, val_loader, device)
         
-        print("   [TS-EntropyRAPS] Step 2: Optimizing lambda for stratified safety...")
+        print("   [TS-EntropyRAPS] Step 2: Optimizing lambda via minimax...")
         self.lamda_star, self.q_hat_star = self._optimize_lambda_entropy()
-        print(f"   [TS-EntropyRAPS] Lambda: {self.lamda_star:.5f}")
+        print(f"   [TS-EntropyRAPS] λ*={self.lamda_star:.5f}, q_hat={self.q_hat_star:.4f}")
     
     def _get_qhat(self, logits, labels, lamda):
-        """Compute RAPS quantile with temperature-scaled probabilities."""
-        probs = torch.softmax(logits / self.temperature, dim=1)
-        sorted_probs, idx = torch.sort(probs, dim=1, descending=True)
-        cumsum = torch.cumsum(sorted_probs, dim=1)
-        
-        rows = torch.arange(len(labels))
-        ranks = torch.zeros(len(labels), dtype=torch.long)
-        for i, lbl in enumerate(labels):
-            rank = (idx[i] == lbl).nonzero(as_tuple=True)[0]
-            ranks[i] = rank.item() if len(rank) > 0 else 0
-        
-        scores = cumsum[rows, ranks] + lamda * torch.clamp(ranks - self.k_reg + 1, min=0)
-        n = len(labels)
-        return np.quantile(
-            scores.numpy(),
-            np.ceil((n + 1) * (1 - self.alpha)) / n,
-            method='higher'
+        """Compute RAPS quantile (FIXED with randomization)."""
+        scores = compute_raps_scores_randomized(
+            logits, labels, lamda, self.k_reg,
+            self.temperature, randomized=self.randomized
         )
+        return compute_quantile(scores, self.alpha)
     
     def _optimize_lambda_entropy(self):
         """Select lambda via minimax over entropy strata."""
-        # Define entropy boundaries on tune set (with temperature scaling)
+        # Define entropy boundaries on tune set
         tune_entropy = calculate_entropy(self.logits_tune, self.temperature)
         th1, th2 = np.quantile(tune_entropy, [0.33, 0.66])
         
-        print(f"      Entropy boundaries (T-scaled): [{th1:.3f}, {th2:.3f}]")
+        print(f"      Entropy boundaries: [{th1:.3f}, {th2:.3f}]")
         
-        # Apply to validation set
+        # Apply to val set
         val_entropy = calculate_entropy(self.logits_val, self.temperature)
         strata_idxs = [
             np.where(val_entropy <= th1)[0],
@@ -381,91 +384,65 @@ class TemperatureScaledEntropyRAPS(nn.Module):
             np.where(val_entropy > th2)[0]
         ]
         
-        print(f"      Val set strata: Easy={len(strata_idxs[0])}, "
+        print(f"      Val strata: Easy={len(strata_idxs[0])}, "
               f"Med={len(strata_idxs[1])}, Hard={len(strata_idxs[2])}")
         
         # Lambda selection via minimax
-        lambda_grid = np.linspace(0, 0.05, 20)
+        lambda_grid = np.linspace(0, 0.1, 30)
         best_lam, best_q = 0.0, 0.0
         min_max_violation = float('inf')
         best_avg_size = float('inf')
         
         for lam in lambda_grid:
-            # Compute quantile on calibration set
             q_cand = self._get_qhat(self.logits_cal, self.labels_cal, lam)
             
-            # Evaluate on validation set with temperature scaling
-            probs_val = torch.softmax(self.logits_val / self.temperature, dim=1)
-            sorted_probs, idx = torch.sort(probs_val, dim=1, descending=True)
-            cumsum = torch.cumsum(sorted_probs, dim=1)
+            # Evaluate on val set
+            probs_val = torch.softmax(self.logits_val / self.temperature, dim=1).cpu().numpy()
             
-            rows = torch.arange(len(self.labels_val))
-            ranks = torch.zeros(len(self.labels_val), dtype=torch.long)
-            for i, lbl in enumerate(self.labels_val):
-                rank = (idx[i] == lbl).nonzero(as_tuple=True)[0]
-                ranks[i] = rank.item() if len(rank) > 0 else 0
-            
-            scores_val = cumsum[rows, ranks] + lam * torch.clamp(
-                ranks - self.k_reg + 1, min=0
+            pred_sets = construct_prediction_sets_gcq(
+                probs_val, q_cand, lam, self.k_reg,
+                randomized=self.randomized, allow_zero_sets=False
             )
-            is_covered = (scores_val <= q_cand).numpy().astype(int)
             
-            # Compute average size for tie-breaking
-            penalties = lam * torch.clamp(
-                torch.arange(self.num_classes) - self.k_reg + 1, min=0
-            )
-            scores_all = cumsum + penalties.unsqueeze(0)
-            sizes = (scores_all <= q_cand).sum(dim=1)
-            curr_avg_size = sizes.float().mean().item()
+            # Coverage per stratum
+            is_covered = np.array([
+                self.labels_val[i].item() in pred_sets[i]
+                for i in range(len(self.labels_val))
+            ])
             
-            # Compute worst-case violation
             violations = []
             for s_idx in strata_idxs:
-                if len(s_idx) == 0: continue
-                cov = np.mean(is_covered[s_idx])
-                violations.append(abs(cov - (1 - self.alpha)))
+                if len(s_idx) > 0:
+                    cov = np.mean(is_covered[s_idx])
+                    violations.append(abs(cov - (1 - self.alpha)))
+            
             max_viol = max(violations) if violations else 1.0
+            avg_size = np.mean([len(s) for s in pred_sets])
             
             # Minimax selection
             if max_viol < min_max_violation:
                 min_max_violation = max_viol
                 best_lam = lam
                 best_q = q_cand
-                best_avg_size = curr_avg_size
-            elif abs(max_viol - min_max_violation) < 0.001:
-                if curr_avg_size < best_avg_size:
-                    min_max_violation = max_viol
+                best_avg_size = avg_size
+            elif abs(max_viol - min_max_violation) < 0.005:
+                if avg_size < best_avg_size:
                     best_lam = lam
                     best_q = q_cand
-                    best_avg_size = curr_avg_size
+                    best_avg_size = avg_size
         
         return best_lam, best_q
     
     def forward(self, x):
-        """Forward pass with temperature-scaled entropy-RAPS."""
+        """Forward pass with FIXED prediction set construction."""
         with torch.no_grad():
             logits = self.model(x)
+            probs = torch.softmax(logits / self.temperature, dim=1).cpu().numpy()
             
-            # Apply temperature scaling
-            probs = torch.softmax(logits / self.temperature, dim=1)
-            sorted_probs, idx = torch.sort(probs, dim=1, descending=True)
-            cumsum = torch.cumsum(sorted_probs, dim=1)
-            
-            prediction_sets = []
-            for i in range(x.size(0)):
-                penalties = self.lamda_star * torch.clamp(
-                    torch.arange(self.num_classes, device=x.device) - self.k_reg + 1,
-                    min=0
-                )
-                scores = cumsum[i] + penalties
-                
-                mask = scores <= self.q_hat_star
-                if mask.sum() == 0:
-                    k_star = 0
-                else:
-                    k_star = mask.nonzero()[-1].item()
-                
-                pred_set = idx[i, :k_star+1].cpu().numpy()
-                prediction_sets.append(pred_set)
+            prediction_sets = construct_prediction_sets_gcq(
+                probs, self.q_hat_star,
+                lamda=self.lamda_star, k_reg=self.k_reg,
+                randomized=self.randomized, allow_zero_sets=False
+            )
             
             return logits, prediction_sets

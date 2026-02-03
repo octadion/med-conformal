@@ -1,10 +1,12 @@
 """
-RAPS Variants with Alternative Difficulty Proxies
+RAPS Variants with Alternative Difficulty Proxies (FIXED)
 
 This module implements RAPS with margin-based and confidence×trust proxies
 as baselines for comparison with entropy-stratified RAPS.
 
 Addresses Stanford Reviewer Point #4 ablation study request.
+
+FIXED: Uses randomized calibration scores matching original RAPS paper.
 """
 
 import torch
@@ -20,10 +22,10 @@ from models.alternative_proxies import (
     compute_confidence_trust_proxy,
     get_stratum_indices
 )
-from models.randomization_utils import compute_randomized_quantile
 
 
 def get_logits_labels(model, loader, device='cuda'):
+    """Extract logits and labels from dataloader."""
     model.eval()
     logits_list = []
     labels_list = []
@@ -38,39 +40,131 @@ def get_logits_labels(model, loader, device='cuda'):
     return torch.cat(logits_list), torch.cat(labels_list)
 
 
-def compute_raps_scores_batch(logits, labels, lamda, k_reg, temperature=1.0):
-    """Compute RAPS conformity scores."""
+def compute_raps_scores_randomized(logits: torch.Tensor, 
+                                    labels: torch.Tensor, 
+                                    lamda: float,
+                                    k_reg: int,
+                                    temperature: float = 1.0,
+                                    randomized: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute RAPS conformity scores WITH randomization (matching original paper).
+    
+    FIXED: From original conformal.py get_tau():
+        score = U * p_y + cumsum[rank-1] + penalty
+    
+    Args:
+        logits: Model outputs (N, K)
+        labels: True labels (N,)
+        lamda: RAPS regularization parameter
+        k_reg: Regularization starting point
+        temperature: Temperature scaling factor
+        randomized: If True, use randomized scores (recommended)
+    
+    Returns:
+        Tuple of (scores, sorted_probs, indices)
+    """
     probs = torch.softmax(logits / temperature, dim=1)
     sorted_probs, indices = torch.sort(probs, dim=1, descending=True)
     cumsum = torch.cumsum(sorted_probs, dim=1)
     
-    rows = torch.arange(len(labels))
-    ranks = torch.zeros(len(labels), dtype=torch.long)
-    for i, lbl in enumerate(labels):
-        rank = (indices[i] == lbl).nonzero(as_tuple=True)[0]
-        ranks[i] = rank.item() if len(rank) > 0 else 0
+    n_samples = len(labels)
+    scores = np.zeros(n_samples)
     
-    penalty = lamda * torch.clamp(ranks - k_reg + 1, min=0)
-    scores = cumsum[rows, ranks] + penalty
+    for i in range(n_samples):
+        # Find rank of true label in sorted order
+        rank_tensor = (indices[i] == labels[i]).nonzero(as_tuple=True)[0]
+        rank = rank_tensor.item() if len(rank_tensor) > 0 else 0
+        
+        p_y = sorted_probs[i, rank].item()
+        
+        # Compute penalty: λ * max(rank - k_reg + 1, 0)
+        penalty = lamda * max(rank - k_reg + 1, 0)
+        
+        if randomized:
+            U = np.random.random()
+        else:
+            U = 1.0
+        
+        if rank == 0:
+            # True label is top-1
+            scores[i] = U * p_y + penalty
+        else:
+            # True label is rank k > 0
+            cumsum_before = cumsum[i, rank - 1].item()
+            scores[i] = U * p_y + cumsum_before + penalty
     
-    return scores.numpy(), sorted_probs.numpy(), indices.numpy()
+    return scores, sorted_probs.numpy(), indices.numpy()
+
+
+def compute_quantile(scores: np.ndarray, alpha: float) -> float:
+    """Compute conformal quantile (matching original paper)."""
+    return np.quantile(scores, 1 - alpha, method='higher')
+
+
+def construct_prediction_sets_gcq(probs: np.ndarray, 
+                                   q_hat: float,
+                                   lamda: float = 0.0,
+                                   k_reg: int = 2,
+                                   randomized: bool = True,
+                                   allow_zero_sets: bool = False) -> List[np.ndarray]:
+    """
+    Construct prediction sets using Generalized Conditional Quantile (gcq).
+    
+    This is the EXACT algorithm from original conformal.py.
+    """
+    n_samples, n_classes = probs.shape
+    
+    # Sort probabilities descending
+    I = probs.argsort(axis=1)[:, ::-1]
+    ordered = np.sort(probs, axis=1)[:, ::-1]
+    cumsum = np.cumsum(ordered, axis=1)
+    
+    # Compute cumulative penalties (flat penalty after k_reg, like original)
+    penalties = np.zeros(n_classes)
+    penalties[k_reg:] = lamda
+    penalties_cumsum = np.cumsum(penalties)
+    
+    # Base set sizes
+    sizes_base = ((cumsum + penalties_cumsum) <= q_hat).sum(axis=1) + 1
+    sizes_base = np.minimum(sizes_base, n_classes)
+    
+    if randomized:
+        # Compute V for randomized inclusion
+        V = np.zeros(n_samples)
+        for i in range(n_samples):
+            idx = sizes_base[i] - 1
+            if idx >= 0 and ordered[i, idx] > 1e-10:
+                score_without_last = (cumsum[i, idx] - ordered[i, idx]) + penalties_cumsum[idx]
+                V[i] = (q_hat - score_without_last) / ordered[i, idx]
+                V[i] = np.clip(V[i], 0.0, 1.0)
+        
+        # Randomized exclusion
+        sizes = sizes_base - (np.random.random(n_samples) >= V).astype(int)
+    else:
+        sizes = sizes_base
+    
+    # Handle special cases
+    if q_hat >= 1.0:
+        sizes[:] = n_classes
+    
+    if not allow_zero_sets:
+        sizes = np.maximum(sizes, 1)
+    
+    # Build prediction sets
+    prediction_sets = [I[i, :sizes[i]] for i in range(n_samples)]
+    
+    return prediction_sets
 
 
 # ============================================================================
-# MARGIN-STRATIFIED RAPS
+# MARGIN-STRATIFIED RAPS (FIXED)
 # ============================================================================
 
 class MarginStratifiedRAPS(nn.Module):
     """
-    RAPS with margin-based stratification.
+    RAPS with margin-based stratification (FIXED).
     
-    Baseline comparison to test if margin-based difficulty proxy works as well
-    as entropy for worst-case coverage optimization.
-    
-    Protocol (same as EntropyRAPS):
-    1. Tune set: Define margin tertile boundaries
-    2. Calib set: Compute q_hat(λ) for each λ
-    3. Val set: Select λ via minimax over margin strata
+    FIXED: Uses randomized calibration scores matching original RAPS paper.
     """
     
     def __init__(self, model, tune_loader, calib_loader, val_loader,
@@ -89,143 +183,102 @@ class MarginStratifiedRAPS(nn.Module):
         self.logits_val, self.labels_val = get_logits_labels(model, val_loader, device)
         
         print(f"   [Margin-RAPS] Optimizing Lambda (randomized={randomized})...")
-        self.lamda_star, self.q_hat_star, self.U = self._optimize_lambda_margin()
-        print(f"   [Margin-RAPS] Lambda: {self.lamda_star:.5f}")
+        self.lamda_star, self.q_hat_star = self._optimize_lambda_margin()
+        print(f"   [Margin-RAPS] λ*={self.lamda_star:.5f}, q_hat={self.q_hat_star:.4f}")
     
     def _get_qhat(self, logits, labels, lamda):
-        """Compute quantile with randomization."""
-        scores, _, _ = compute_raps_scores_batch(
-            logits, labels, lamda, self.k_reg, temperature=1.0
+        """Compute quantile on calibration set (FIXED with randomization)."""
+        scores, _, _ = compute_raps_scores_randomized(
+            logits, labels, lamda, self.k_reg, 
+            temperature=1.0, randomized=self.randomized
         )
-        q_hat, U = compute_randomized_quantile(scores, self.alpha, self.randomized)
-        return q_hat, U
+        return compute_quantile(scores, self.alpha)
     
     def _optimize_lambda_margin(self):
-        """
-        Select λ via minimax over margin-based strata.
-        
-        STEP 1: Define margin boundaries on TUNE set
-        STEP 2: For each λ, compute q_hat(λ) on CALIB set
-        STEP 3: Evaluate stratified coverage on VAL set
-        STEP 4: Select λ* via minimax
-        """
+        """Select λ via minimax over margin-based strata."""
         # STEP 1: Margin boundaries on tune set
         tune_margin = compute_margin_proxy(self.logits_tune)
         th1, th2 = np.quantile(tune_margin, [0.33, 0.66])
         
-        print(f"      Margin boundaries (from tune set): [{th1:.3f}, {th2:.3f}]")
+        print(f"      Margin boundaries: [{th1:.3f}, {th2:.3f}]")
         
         # Apply to validation set
         val_margin = compute_margin_proxy(self.logits_val)
         strata_idxs = get_stratum_indices(val_margin, [th1, th2])
         
-        print(f"      Val set strata: Easy={len(strata_idxs[0])}, "
+        print(f"      Val strata: Easy={len(strata_idxs[0])}, "
               f"Med={len(strata_idxs[1])}, Hard={len(strata_idxs[2])}")
         
-        # STEP 2-4: Lambda selection
-        lambda_grid = np.linspace(0, 0.05, 20)
-        best_lam, best_q, best_U = 0.0, 0.0, None
+        # Lambda selection
+        lambda_grid = np.linspace(0, 0.1, 30)
+        best_lam, best_q = 0.0, 0.0
         min_max_violation = float('inf')
         best_avg_size = float('inf')
         
         for lam in lambda_grid:
-            q_cand, U_cand = self._get_qhat(self.logits_cal, self.labels_cal, lam)
+            q_cand = self._get_qhat(self.logits_cal, self.labels_cal, lam)
             
             # Evaluate on validation set
-            probs_val = torch.softmax(self.logits_val, dim=1)
-            sorted_probs, idx = torch.sort(probs_val, dim=1, descending=True)
-            cumsum = torch.cumsum(sorted_probs, dim=1)
+            probs_val = torch.softmax(self.logits_val, dim=1).cpu().numpy()
             
-            rows = torch.arange(len(self.labels_val))
-            ranks = torch.zeros(len(self.labels_val), dtype=torch.long)
-            for i, lbl in enumerate(self.labels_val):
-                rank = (idx[i] == lbl).nonzero(as_tuple=True)[0]
-                ranks[i] = rank.item() if len(rank) > 0 else 0
+            pred_sets = construct_prediction_sets_gcq(
+                probs_val, q_cand, lam, self.k_reg,
+                randomized=self.randomized, allow_zero_sets=False
+            )
             
-            scores_val = cumsum[rows, ranks] + lam * torch.clamp(ranks - self.k_reg + 1, min=0)
-            is_covered = (scores_val <= q_cand).numpy().astype(int)
+            # Compute coverage per stratum
+            is_covered = np.array([
+                self.labels_val[i].item() in pred_sets[i]
+                for i in range(len(self.labels_val))
+            ])
             
-            # Compute average size for tie-breaking
-            penalties = lam * torch.clamp(torch.arange(self.num_classes) - self.k_reg + 1, min=0)
-            scores_all = cumsum + penalties.unsqueeze(0)
-            sizes = (scores_all <= q_cand).sum(dim=1)
-            curr_avg_size = sizes.float().mean().item()
-            
-            # Minimax selection
             violations = []
             for s_idx in strata_idxs:
-                if len(s_idx) == 0: continue
-                cov = np.mean(is_covered[s_idx])
-                violations.append(abs(cov - (1 - self.alpha)))
-            max_viol = max(violations) if violations else 1.0
+                if len(s_idx) > 0:
+                    cov = np.mean(is_covered[s_idx])
+                    violations.append(abs(cov - (1 - self.alpha)))
             
+            max_viol = max(violations) if violations else 1.0
+            avg_size = np.mean([len(s) for s in pred_sets])
+            
+            # Minimax selection
             if max_viol < min_max_violation:
                 min_max_violation = max_viol
-                best_lam, best_q, best_U = lam, q_cand, U_cand
-                best_avg_size = curr_avg_size
-            elif abs(max_viol - min_max_violation) < 0.001:
-                if curr_avg_size < best_avg_size:
-                    min_max_violation = max_viol
-                    best_lam, best_q, best_U = lam, q_cand, U_cand
-                    best_avg_size = curr_avg_size
+                best_lam = lam
+                best_q = q_cand
+                best_avg_size = avg_size
+            elif abs(max_viol - min_max_violation) < 0.005:
+                if avg_size < best_avg_size:
+                    best_lam = lam
+                    best_q = q_cand
+                    best_avg_size = avg_size
         
-        return best_lam, best_q, best_U
+        return best_lam, best_q
     
     def forward(self, x):
+        """Forward pass with FIXED prediction set construction."""
         with torch.no_grad():
             logits = self.model(x)
             probs = torch.softmax(logits, dim=1).cpu().numpy()
-            sorted_probs, indices = torch.sort(probs, dim=1, descending=True)
-            cumsum = torch.cumsum(sorted_probs, dim=1)
             
-            prediction_sets = []
-            penalties = self.lamda_star * torch.clamp(
-                torch.arange(self.num_classes) - self.k_reg + 1, min=0
+            prediction_sets = construct_prediction_sets_gcq(
+                probs, self.q_hat_star,
+                lamda=self.lamda_star, k_reg=self.k_reg,
+                randomized=self.randomized, allow_zero_sets=False
             )
-            
-            for i in range(x.size(0)):
-                scores = cumsum[i] + penalties
-                
-                if not self.randomized or self.U is None:
-                    mask = scores <= self.q_hat_star
-                    k_star = mask.nonzero()[-1].item() if mask.sum() > 0 else 0
-                else:
-                    below = scores < self.q_hat_star
-                    k_base = below.nonzero()[-1].item() + 1 if below.sum() > 0 else 0
-                    
-                    if k_base < len(scores):
-                        at_boundary = torch.isclose(
-                            scores[k_base], torch.tensor(self.q_hat_star), atol=1e-6
-                        )
-                        if at_boundary and np.random.rand() < self.U:
-                            k_star = k_base
-                        else:
-                            k_star = k_base - 1 if k_base > 0 else 0
-                    else:
-                        k_star = k_base - 1
-                    
-                    k_star = max(0, k_star)
-                
-                pred_set = indices[i, :k_star + 1].cpu().numpy()
-                prediction_sets.append(pred_set)
             
             return logits, prediction_sets
 
 
 # ============================================================================
-# CONFIDENCE × TRUST STRATIFIED RAPS
+# CONFIDENCE × TRUST STRATIFIED RAPS (FIXED)
 # ============================================================================
 
 class ConfTrustStratifiedRAPS(nn.Module):
     """
-    RAPS with confidence×trust stratification.
+    RAPS with confidence×trust stratification (FIXED).
     
-    Baseline comparison testing the conf×trust product as difficulty proxy.
-    
-    Protocol (same as EntropyRAPS):
-    1. Tune set: Define conf×trust tertile boundaries
-    2. Calib set: Compute q_hat(λ) for each λ
-    3. Val set: Select λ via minimax over conf×trust strata
+    FIXED: Uses randomized calibration scores matching original RAPS paper.
     """
     
     def __init__(self, model, tune_loader, calib_loader, val_loader,
@@ -244,124 +297,88 @@ class ConfTrustStratifiedRAPS(nn.Module):
         self.logits_val, self.labels_val = get_logits_labels(model, val_loader, device)
         
         print(f"   [ConfTrust-RAPS] Optimizing Lambda (randomized={randomized})...")
-        self.lamda_star, self.q_hat_star, self.U = self._optimize_lambda_conftrust()
-        print(f"   [ConfTrust-RAPS] Lambda: {self.lamda_star:.5f}")
+        self.lamda_star, self.q_hat_star = self._optimize_lambda_conftrust()
+        print(f"   [ConfTrust-RAPS] λ*={self.lamda_star:.5f}, q_hat={self.q_hat_star:.4f}")
     
     def _get_qhat(self, logits, labels, lamda):
-        """Compute quantile with randomization."""
-        scores, _, _ = compute_raps_scores_batch(
-            logits, labels, lamda, self.k_reg, temperature=1.0
+        """Compute quantile on calibration set (FIXED with randomization)."""
+        scores, _, _ = compute_raps_scores_randomized(
+            logits, labels, lamda, self.k_reg,
+            temperature=1.0, randomized=self.randomized
         )
-        q_hat, U = compute_randomized_quantile(scores, self.alpha, self.randomized)
-        return q_hat, U
+        return compute_quantile(scores, self.alpha)
     
     def _optimize_lambda_conftrust(self):
-        """
-        Select λ via minimax over confidence×trust strata.
-        
-        STEP 1: Define conf×trust boundaries on TUNE set
-        STEP 2: For each λ, compute q_hat(λ) on CALIB set
-        STEP 3: Evaluate stratified coverage on VAL set
-        STEP 4: Select λ* via minimax
-        """
+        """Select λ via minimax over confidence×trust strata."""
         # STEP 1: ConfTrust boundaries on tune set
         tune_conftrust = compute_confidence_trust_proxy(self.logits_tune)
         th1, th2 = np.quantile(tune_conftrust, [0.33, 0.66])
         
-        print(f"      ConfTrust boundaries (from tune set): [{th1:.3f}, {th2:.3f}]")
+        print(f"      ConfTrust boundaries: [{th1:.3f}, {th2:.3f}]")
         
         # Apply to validation set
         val_conftrust = compute_confidence_trust_proxy(self.logits_val)
         strata_idxs = get_stratum_indices(val_conftrust, [th1, th2])
         
-        print(f"      Val set strata: Easy={len(strata_idxs[0])}, "
+        print(f"      Val strata: Easy={len(strata_idxs[0])}, "
               f"Med={len(strata_idxs[1])}, Hard={len(strata_idxs[2])}")
         
-        # STEP 2-4: Lambda selection
-        lambda_grid = np.linspace(0, 0.05, 20)
-        best_lam, best_q, best_U = 0.0, 0.0, None
+        # Lambda selection
+        lambda_grid = np.linspace(0, 0.1, 30)
+        best_lam, best_q = 0.0, 0.0
         min_max_violation = float('inf')
         best_avg_size = float('inf')
         
         for lam in lambda_grid:
-            q_cand, U_cand = self._get_qhat(self.logits_cal, self.labels_cal, lam)
+            q_cand = self._get_qhat(self.logits_cal, self.labels_cal, lam)
             
             # Evaluate on validation set
-            probs_val = torch.softmax(self.logits_val, dim=1)
-            sorted_probs, idx = torch.sort(probs_val, dim=1, descending=True)
-            cumsum = torch.cumsum(sorted_probs, dim=1)
+            probs_val = torch.softmax(self.logits_val, dim=1).cpu().numpy()
             
-            rows = torch.arange(len(self.labels_val))
-            ranks = torch.zeros(len(self.labels_val), dtype=torch.long)
-            for i, lbl in enumerate(self.labels_val):
-                rank = (idx[i] == lbl).nonzero(as_tuple=True)[0]
-                ranks[i] = rank.item() if len(rank) > 0 else 0
+            pred_sets = construct_prediction_sets_gcq(
+                probs_val, q_cand, lam, self.k_reg,
+                randomized=self.randomized, allow_zero_sets=False
+            )
             
-            scores_val = cumsum[rows, ranks] + lam * torch.clamp(ranks - self.k_reg + 1, min=0)
-            is_covered = (scores_val <= q_cand).numpy().astype(int)
+            # Compute coverage per stratum
+            is_covered = np.array([
+                self.labels_val[i].item() in pred_sets[i]
+                for i in range(len(self.labels_val))
+            ])
             
-            # Compute average size
-            penalties = lam * torch.clamp(torch.arange(self.num_classes) - self.k_reg + 1, min=0)
-            scores_all = cumsum + penalties.unsqueeze(0)
-            sizes = (scores_all <= q_cand).sum(dim=1)
-            curr_avg_size = sizes.float().mean().item()
-            
-            # Minimax selection
             violations = []
             for s_idx in strata_idxs:
-                if len(s_idx) == 0: continue
-                cov = np.mean(is_covered[s_idx])
-                violations.append(abs(cov - (1 - self.alpha)))
-            max_viol = max(violations) if violations else 1.0
+                if len(s_idx) > 0:
+                    cov = np.mean(is_covered[s_idx])
+                    violations.append(abs(cov - (1 - self.alpha)))
             
+            max_viol = max(violations) if violations else 1.0
+            avg_size = np.mean([len(s) for s in pred_sets])
+            
+            # Minimax selection
             if max_viol < min_max_violation:
                 min_max_violation = max_viol
-                best_lam, best_q, best_U = lam, q_cand, U_cand
-                best_avg_size = curr_avg_size
-            elif abs(max_viol - min_max_violation) < 0.001:
-                if curr_avg_size < best_avg_size:
-                    min_max_violation = max_viol
-                    best_lam, best_q, best_U = lam, q_cand, U_cand
-                    best_avg_size = curr_avg_size
+                best_lam = lam
+                best_q = q_cand
+                best_avg_size = avg_size
+            elif abs(max_viol - min_max_violation) < 0.005:
+                if avg_size < best_avg_size:
+                    best_lam = lam
+                    best_q = q_cand
+                    best_avg_size = avg_size
         
-        return best_lam, best_q, best_U
+        return best_lam, best_q
     
     def forward(self, x):
+        """Forward pass with FIXED prediction set construction."""
         with torch.no_grad():
             logits = self.model(x)
             probs = torch.softmax(logits, dim=1).cpu().numpy()
-            sorted_probs, indices = torch.sort(probs, dim=1, descending=True)
-            cumsum = torch.cumsum(sorted_probs, dim=1)
             
-            prediction_sets = []
-            penalties = self.lamda_star * torch.clamp(
-                torch.arange(self.num_classes) - self.k_reg + 1, min=0
+            prediction_sets = construct_prediction_sets_gcq(
+                probs, self.q_hat_star,
+                lamda=self.lamda_star, k_reg=self.k_reg,
+                randomized=self.randomized, allow_zero_sets=False
             )
-            
-            for i in range(x.size(0)):
-                scores = cumsum[i] + penalties
-                
-                if not self.randomized or self.U is None:
-                    mask = scores <= self.q_hat_star
-                    k_star = mask.nonzero()[-1].item() if mask.sum() > 0 else 0
-                else:
-                    below = scores < self.q_hat_star
-                    k_base = below.nonzero()[-1].item() + 1 if below.sum() > 0 else 0
-                    
-                    if k_base < len(scores):
-                        at_boundary = torch.isclose(
-                            scores[k_base], torch.tensor(self.q_hat_star), atol=1e-6
-                        )
-                        if at_boundary and np.random.rand() < self.U:
-                            k_star = k_base
-                        else:
-                            k_star = k_base - 1 if k_base > 0 else 0
-                    else:
-                        k_star = k_base - 1
-                    
-                    k_star = max(0, k_star)
-                
-                pred_set = indices[i, :k_star + 1].cpu().numpy()
-                prediction_sets.append(pred_set)
             
             return logits, prediction_sets
