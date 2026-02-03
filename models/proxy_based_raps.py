@@ -174,7 +174,7 @@ class MarginStratifiedRAPS(nn.Module):
     def forward(self, x):
         with torch.no_grad():
             logits = self.model(x)
-            probs = torch.softmax(logits, dim=1)
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
             sorted_probs, indices = torch.sort(probs, dim=1, descending=True)
             cumsum = torch.cumsum(sorted_probs, dim=1)
             
@@ -329,7 +329,7 @@ class ConfTrustStratifiedRAPS(nn.Module):
     def forward(self, x):
         with torch.no_grad():
             logits = self.model(x)
-            probs = torch.softmax(logits, dim=1)
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
             sorted_probs, indices = torch.sort(probs, dim=1, descending=True)
             cumsum = torch.cumsum(sorted_probs, dim=1)
             
