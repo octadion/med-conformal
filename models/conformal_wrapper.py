@@ -1,3 +1,17 @@
+"""
+Conformal Prediction Wrapper (FINAL VERSION)
+
+Key Features:
+1. Randomized calibration scores (matching original RAPS paper)
+2. allow_zero_sets parameter for validation experiments
+3. Multi-alpha support for sensitivity analysis
+
+Changes from previous version:
+- Added allow_zero_sets parameter to all methods
+- Added alpha as configurable parameter for sensitivity analysis
+- Clean separation of concerns
+"""
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -15,9 +29,9 @@ def get_logits_labels(model, loader, device='cuda'):
             x = x.to(device)
             out = model(x)
             logits_list.append(out.cpu())
-            if len(y.shape) > 1:
-                y = y.squeeze()
-            labels_list.append(y.cpu())
+            # Ensure labels are always 1D (handles scalar and multi-dim cases)
+            y = y.cpu().view(-1)
+            labels_list.append(y)
     return torch.cat(logits_list), torch.cat(labels_list)
 
 
