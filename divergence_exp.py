@@ -7,12 +7,14 @@ sys.path.append('.')
 from data.dataloader import MedMNISTDataLoader
 from models.base_model import get_model
 from models.conformal_wrapper import SizeOptimizedRAPS, EntropyStratifiedRAPS, predict_with_sets
-from training.trainer import Trainer
 import numpy as np
 from scipy.stats import entropy
-from torch.utils.data import Subset
+from torch.utils.data import Subset, DataLoader
+
 
 class ImbalancedDifficultyDataset:
+    """Create dataset with imbalanced difficulty distribution."""
+    
     def __init__(self, base_dataset, model, 
                  hard_ratio=0.1, medium_ratio=0.2, easy_ratio=0.9,
                  device='cuda', seed=42):
@@ -65,18 +67,13 @@ class ImbalancedDifficultyDataset:
         self.model.eval()
         entropies = []
         
-        loader = torch.utils.data.DataLoader(
-            self.base_dataset, 
-            batch_size=128, 
-            shuffle=False
-        )
+        loader = DataLoader(self.base_dataset, batch_size=128, shuffle=False)
         
         with torch.no_grad():
             for x, _ in loader:
                 x = x.to(self.device)
                 logits = self.model(x)
                 probs = torch.softmax(logits, dim=1).cpu().numpy()
-                
                 batch_entropy = entropy(probs, axis=1)
                 entropies.extend(batch_entropy)
         
@@ -87,9 +84,6 @@ class ImbalancedDifficultyDataset:
     
     def get_stratum_info(self):
         return {
-            'easy_indices': np.where(self.easy_mask_new)[0],
-            'medium_indices': np.where(self.medium_mask_new)[0],
-            'hard_indices': np.where(self.hard_mask_new)[0],
             'easy_count': self.easy_mask_new.sum(),
             'medium_count': self.medium_mask_new.sum(),
             'hard_count': self.hard_mask_new.sum(),
@@ -105,34 +99,42 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     # Load data
-    print("[1/3] Loading data...")
+    print("[1/5] Loading data...")
     data_loader = MedMNISTDataLoader(config)
     train_loader, val_loader, test_loader = data_loader.load_data()
     
-    print("[2/3] Loading trained model...")
+    print("[2/5] Loading trained model...")
     model = get_model(config, device)
 
-    checkpoint_path = Path('/content/drive/MyDrive/MedConformal_Final_Submission2/pathmnist_final/models/pathmnist_exp_20260122_153413_best_model.pth')
+    # Try multiple checkpoint paths
+    checkpoint_paths = [
+        Path('/content/drive/MyDrive/MedConformal_Final_Submission5/pathmnist_final/models/best_model.pth'),
+        Path('/content/drive/MyDrive/MedConformal_Final_Submission2/pathmnist_final/models/pathmnist_exp_20260122_153413_best_model.pth'),
+        Path('./quick_test_output/pathmnist_model.pth'),
+    ]
     
-    if checkpoint_path.exists():
-        print(f"   Loading from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        print("   ✅ Model loaded successfully!")
-    else:
-        print("   ⚠️ Checkpoint not found, training new model...")
-        from lib_utils.logger import ExperimentLogger
-        save_dir = Path('divergence_results')
-        save_dir.mkdir(parents=True, exist_ok=True)
-        logger = ExperimentLogger(str(save_dir), 'divergence_exp')
-        
-        trainer = Trainer(model, config, device)
-        model = trainer.train(train_loader, val_loader, logger)
+    model_loaded = False
+    for checkpoint_path in checkpoint_paths:
+        if checkpoint_path.exists():
+            print(f"   Loading from {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                model.load_state_dict(checkpoint)
+            print("   ✅ Model loaded successfully!")
+            model_loaded = True
+            break
+    
+    if not model_loaded:
+        print("   ⚠️ Checkpoint not found! Run main.py or quick_test_pathmnist.py first.")
+        return
     
     trained_model = model
+    trained_model.eval()
     
     # Create IMBALANCED dataset
-    print("\n[3/3] Creating imbalanced difficulty dataset...")
+    print("\n[3/5] Creating imbalanced difficulty dataset...")
     imb_val = ImbalancedDifficultyDataset(
         val_loader.dataset, trained_model,
         hard_ratio=0.05, medium_ratio=0.1, easy_ratio=0.95,
@@ -144,35 +146,75 @@ def main():
         device=device, seed=43
     )
     
-    # Split to cal/tune
+    # 3-WAY SPLIT (FIXED!)
+    print("\n[4/5] Creating 3-way split...")
     imb_val_ds = imb_val.get_subset()
     n = len(imb_val_ds)
-    n_cal = int(0.7 * n)
-    cal_ds, tune_ds = torch.utils.data.random_split(imb_val_ds, [n_cal, n - n_cal])
     
-    cal_loader = torch.utils.data.DataLoader(cal_ds, batch_size=32, shuffle=False)
-    tune_loader = torch.utils.data.DataLoader(tune_ds, batch_size=32, shuffle=False)
-    test_imb_loader = torch.utils.data.DataLoader(imb_test.get_subset(), batch_size=32, shuffle=False)
+    # Split: 30% tune, 40% calib, 30% val
+    n_tune = int(n * 0.3)
+    n_calib = int(n * 0.4)
+    n_val = n - n_tune - n_calib
     
-    # Run methods
-    print("\n[4/4] Running conformal methods...")
-    raps = SizeOptimizedRAPS(trained_model, cal_loader, tune_loader, alpha=0.1, k_reg=2, device=device)
-    entropy_raps = EntropyStratifiedRAPS(trained_model, cal_loader, tune_loader, alpha=0.1, k_reg=2, device=device)
+    indices = np.random.permutation(n)
+    tune_indices = indices[:n_tune]
+    calib_indices = indices[n_tune:n_tune+n_calib]
+    val_indices = indices[n_tune+n_calib:]
+    
+    # Create subsets
+    tune_ds = Subset(imb_val_ds, tune_indices)
+    calib_ds = Subset(imb_val_ds, calib_indices)
+    val_ds = Subset(imb_val_ds, val_indices)
+    
+    tune_loader = DataLoader(tune_ds, batch_size=32, shuffle=False)
+    calib_loader = DataLoader(calib_ds, batch_size=32, shuffle=False)
+    val_split_loader = DataLoader(val_ds, batch_size=32, shuffle=False)
+    test_imb_loader = DataLoader(imb_test.get_subset(), batch_size=32, shuffle=False)
+    
+    print(f"   Tune: {len(tune_ds)}, Calib: {len(calib_ds)}, Val: {len(val_ds)}")
+    
+    # Run methods (FIXED API!)
+    print("\n[5/5] Running conformal methods...")
+    
+    raps = SizeOptimizedRAPS(
+        trained_model, 
+        tune_loader,      # tune_loader first
+        calib_loader,     # then calib_loader
+        val_split_loader, # then val_loader
+        alpha=0.1, 
+        k_reg=2, 
+        randomized=True,
+        device=device
+    )
+    
+    entropy_raps = EntropyStratifiedRAPS(
+        trained_model, 
+        tune_loader,      # tune_loader first
+        calib_loader,     # then calib_loader
+        val_split_loader, # then val_loader
+        alpha=0.1, 
+        k_reg=2, 
+        randomized=True,
+        device=device
+    )
     
     print(f"\n{'='*60}")
     print("DIVERGENCE RESULTS:")
     print(f"{'='*60}")
     print(f"Standard RAPS λ: {raps.lamda_star:.5f}")
-    print(f"EntropyRAPS λ: {entropy_raps.lamda_star:.5f}")
-    print(f"Difference: {abs(raps.lamda_star - entropy_raps.lamda_star):.5f}")
+    print(f"EntropyRAPS λ:   {entropy_raps.lamda_star:.5f}")
+    print(f"Difference:      {abs(raps.lamda_star - entropy_raps.lamda_star):.5f}")
     
     if abs(raps.lamda_star - entropy_raps.lamda_star) > 0.01:
         print("\n✅ DIVERGENCE DETECTED!")
+        print("   EntropyRAPS selects different λ than Standard RAPS")
     else:
-        print("\n⚠️ No divergence (try more extreme imbalance)")
+        print("\n⚠️ No significant divergence (try more extreme imbalance)")
     
     # Evaluate coverage
-    print("\n[5/5] Evaluating coverage...")
+    print(f"\n{'='*60}")
+    print("COVERAGE COMPARISON:")
+    print(f"{'='*60}")
     
     # RAPS
     _, _, probs_raps, sets_raps, labels = predict_with_sets(raps, test_imb_loader)
@@ -191,19 +233,23 @@ def main():
     hard_cov_raps = np.mean([labels[i] in sets_raps[i] for i in range(len(labels)) if hard_mask[i]])
     hard_cov_ent = np.mean([labels[i] in sets_ent[i] for i in range(len(labels)) if hard_mask[i]])
     
-    print(f"\nStandard RAPS:")
-    print(f"  Overall Coverage: {cov_raps:.1%}")
-    print(f"  Hard Coverage:    {hard_cov_raps:.1%}")
-    print(f"  Avg Set Size:     {size_raps:.2f}")
+    print(f"\n{'Method':<15} {'Overall Cov':<15} {'Hard Cov':<15} {'Avg Size':<10}")
+    print("-" * 55)
+    print(f"{'RAPS-Std':<15} {cov_raps:<15.1%} {hard_cov_raps:<15.1%} {size_raps:<10.2f}")
+    print(f"{'EntropyRAPS':<15} {cov_ent:<15.1%} {hard_cov_ent:<15.1%} {size_ent:<10.2f}")
+    print("-" * 55)
     
-    print(f"\nEntropyRAPS:")
-    print(f"  Overall Coverage: {cov_ent:.1%}")
-    print(f"  Hard Coverage:    {hard_cov_ent:.1%}")
-    print(f"  Avg Set Size:     {size_ent:.2f}")
+    # Improvement
+    hard_improvement = hard_cov_ent - hard_cov_raps
+    print(f"\nHard-case coverage improvement: {hard_improvement:+.1%}")
+    
+    if hard_improvement > 0:
+        print("✅ EntropyRAPS improves hard-case coverage!")
     
     print("\n" + "="*60)
     print("✅ Divergence experiment complete!")
     print("="*60)
+
 
 if __name__ == "__main__":
     main()
