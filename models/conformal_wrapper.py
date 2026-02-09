@@ -1,15 +1,15 @@
 """
-Conformal Prediction Wrapper (FINAL VERSION)
+Conformal Prediction Wrapper (UPDATED)
+
+Changes from previous version:
+- Renamed MondrianCP → StratifiedCP (entropy-based group-conditional CP)
+- Added ClassMondrianCP (true class-conditional Mondrian CP per Vovk 2005)
+- All other methods unchanged
 
 Key Features:
 1. Randomized calibration scores (matching original RAPS paper)
 2. allow_zero_sets parameter for validation experiments
 3. Multi-alpha support for sensitivity analysis
-
-Changes from previous version:
-- Added allow_zero_sets parameter to all methods
-- Added alpha as configurable parameter for sensitivity analysis
-- Clean separation of concerns
 """
 
 import torch
@@ -394,6 +394,7 @@ class EntropyStratifiedRAPS(nn.Module):
         # Define entropy boundaries on tune set
         tune_entropy = calculate_entropy(self.logits_tune)
         th1, th2 = np.quantile(tune_entropy, [0.33, 0.66])
+        self.entropy_boundaries = (th1, th2)
         print(f"      Entropy boundaries: [{th1:.3f}, {th2:.3f}]")
         
         # Apply to val set
@@ -464,9 +465,17 @@ class EntropyStratifiedRAPS(nn.Module):
             return logits, prediction_sets
 
 
-class MondrianCP(nn.Module):
+class StratifiedCP(nn.Module):
     """
-    Mondrian (Group-Conditional) Conformal Prediction with allow_zero_sets support.
+    Stratified (Entropy-Based Group-Conditional) Conformal Prediction.
+    
+    Previously named MondrianCP. Renamed for clarity because this method
+    stratifies by ENTROPY TERTILES, not by class labels.
+    
+    Standard Mondrian CP (Vovk 2005) conditions on class labels.
+    This method conditions on entropy-based difficulty strata instead.
+    
+    Kept for comparison as an alternative group-conditional approach.
     """
     
     def __init__(self, model, tune_loader, calib_loader, val_loader,
@@ -481,17 +490,17 @@ class MondrianCP(nn.Module):
         self.device = device
         self.num_classes = model.num_classes
         
-        print(f"   [Mondrian-CP] Calibrating (allow_zero_sets={allow_zero_sets})...")
+        print(f"   [Stratified-CP] Calibrating (allow_zero_sets={allow_zero_sets})...")
         
         logits_tune, _ = get_logits_labels(model, tune_loader, device)
         self.logits_cal, self.labels_cal = get_logits_labels(model, calib_loader, device)
         
-        # Define entropy boundaries
+        # Define entropy boundaries from tune set
         tune_entropy = calculate_entropy(logits_tune)
         quantiles = np.linspace(0, 1, n_strata + 1)[1:-1]
         self.entropy_boundaries = np.quantile(tune_entropy, quantiles)
         
-        # Per-stratum quantiles
+        # Per-stratum quantiles using calib set
         cal_entropy = calculate_entropy(self.logits_cal)
         cal_strata = self._assign_to_strata(cal_entropy)
         
@@ -560,6 +569,192 @@ class MondrianCP(nn.Module):
                 prediction_sets.append(I[i, :sizes_base])
             
             return logits, prediction_sets
+
+
+# Backward compatibility alias
+MondrianCP = StratifiedCP
+
+
+# =============================================================================
+# NEW: ClassMondrianCP (True Class-Conditional Mondrian CP)
+# =============================================================================
+
+class ClassMondrianCP(nn.Module):
+    """
+    True Class-Conditional Mondrian Conformal Prediction (Vovk 2005).
+    
+    Groups calibration samples by PREDICTED CLASS (ŷ = argmax softmax),
+    then computes a separate APS quantile per class. At test time, the
+    prediction set for sample x is constructed using q_hat_{ŷ(x)}.
+    
+    This is the standard Mondrian CP baseline that reviewers expect.
+    
+    Key differences from StratifiedCP (entropy-based):
+    - Groups = K classes (e.g., 9 for PathMNIST, 11 for OrganAMNIST)
+    - No entropy boundaries needed
+    - No tune_loader required (only calib_loader)
+    - No λ parameter (pure APS scoring)
+    - Per-class calibration sizes vary by class frequency
+    
+    Fallback: If a class has fewer than min_class_size calibration samples,
+    the global (pooled) quantile is used instead.
+    
+    References:
+        Vovk, V. (2005). "Algorithmic Learning in a Random World"
+        Romano, Y., Sesia, M., & Candès, E. J. (2020). 
+            "Classification with Valid and Adaptive Coverage" (NeurIPS)
+    """
+    
+    def __init__(self, model, calib_loader,
+                 alpha=0.1,
+                 randomized=True,
+                 allow_zero_sets=False,
+                 min_class_size=5,
+                 device='cuda',
+                 # Accept but ignore these for API compatibility with runner
+                 tune_loader=None,
+                 val_loader=None):
+        super().__init__()
+        self.model = model
+        self.alpha = alpha
+        self.randomized = randomized
+        self.allow_zero_sets = allow_zero_sets
+        self.min_class_size = min_class_size
+        self.device = device
+        self.num_classes = model.num_classes
+        
+        print(f"   [Class-Mondrian] Calibrating (allow_zero_sets={allow_zero_sets})...")
+        print(f"   [Class-Mondrian] num_classes={self.num_classes}, "
+              f"min_class_size={min_class_size}")
+        
+        # Extract logits and labels from calibration set
+        logits_cal, labels_cal = get_logits_labels(model, calib_loader, device)
+        
+        # Compute predicted classes on calibration set
+        probs_cal = torch.softmax(logits_cal, dim=1)
+        predicted_classes = torch.argmax(probs_cal, dim=1).numpy()
+        
+        # Compute ALL calibration APS scores (for global fallback)
+        all_scores, _, _ = compute_aps_scores_randomized(
+            logits_cal, labels_cal,
+            temperature=1.0, randomized=randomized
+        )
+        self.global_q_hat = compute_quantile(all_scores, alpha)
+        
+        # Per-class quantile calibration
+        self.class_quantiles = {}
+        self.class_sizes = {}
+        fallback_classes = []
+        
+        for k in range(self.num_classes):
+            # Select samples where PREDICTED class is k
+            mask = (predicted_classes == k)
+            n_k = mask.sum()
+            self.class_sizes[k] = int(n_k)
+            
+            if n_k < min_class_size:
+                # Fallback to global quantile
+                self.class_quantiles[k] = self.global_q_hat
+                fallback_classes.append(k)
+                print(f"      Class {k}: n={n_k} < {min_class_size} → "
+                      f"FALLBACK to global q_hat={self.global_q_hat:.4f}")
+            else:
+                # Compute per-class APS scores
+                class_logits = logits_cal[mask]
+                class_labels = labels_cal[mask]
+                
+                class_scores, _, _ = compute_aps_scores_randomized(
+                    class_logits, class_labels,
+                    temperature=1.0, randomized=randomized
+                )
+                
+                self.class_quantiles[k] = compute_quantile(class_scores, alpha)
+                print(f"      Class {k}: n={n_k}, q_hat={self.class_quantiles[k]:.4f}")
+        
+        # Summary
+        n_fallback = len(fallback_classes)
+        print(f"   [Class-Mondrian] Global fallback q_hat: {self.global_q_hat:.4f}")
+        if n_fallback > 0:
+            print(f"   [Class-Mondrian] ⚠ {n_fallback}/{self.num_classes} classes "
+                  f"using fallback: {fallback_classes}")
+        else:
+            print(f"   [Class-Mondrian] ✓ All {self.num_classes} classes have "
+                  f"sufficient calibration samples")
+        
+        # Store calibration info for later analysis
+        self.calibration_info = {
+            'class_sizes': self.class_sizes,
+            'class_quantiles': {k: float(v) for k, v in self.class_quantiles.items()},
+            'global_q_hat': float(self.global_q_hat),
+            'fallback_classes': fallback_classes,
+            'total_calib_samples': len(labels_cal)
+        }
+    
+    def forward(self, x):
+        """
+        Construct prediction sets using class-conditional quantiles.
+        
+        For each test sample:
+        1. Compute softmax probabilities
+        2. Determine predicted class ŷ = argmax(probs)
+        3. Use q_hat_ŷ as the threshold
+        4. Build prediction set via APS-style cumulative sum
+        """
+        with torch.no_grad():
+            logits = self.model(x)
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            
+            # Predicted classes for test batch
+            predicted_classes = np.argmax(probs, axis=1)
+            
+            # Sort probabilities descending for set construction
+            I = probs.argsort(axis=1)[:, ::-1]
+            ordered = np.sort(probs, axis=1)[:, ::-1]
+            cumsum = np.cumsum(ordered, axis=1)
+            
+            prediction_sets = []
+            for i in range(len(probs)):
+                # Get class-specific quantile
+                pred_class = predicted_classes[i]
+                q_hat = self.class_quantiles.get(pred_class, self.global_q_hat)
+                
+                # APS-style set construction (no RAPS penalty)
+                sizes_base = (cumsum[i] <= q_hat).sum() + 1
+                sizes_base = min(sizes_base, probs.shape[1])
+                
+                # Randomized set size
+                if self.randomized and sizes_base > 1:
+                    idx = sizes_base - 1
+                    if ordered[i, idx] > 1e-10:
+                        score_without_last = cumsum[i, idx] - ordered[i, idx]
+                        V = (q_hat - score_without_last) / ordered[i, idx]
+                        V = np.clip(V, 0.0, 1.0)
+                        if np.random.random() >= V:
+                            sizes_base -= 1
+                
+                # Apply allow_zero_sets
+                if not self.allow_zero_sets:
+                    sizes_base = max(sizes_base, 1)
+                
+                prediction_sets.append(I[i, :sizes_base])
+            
+            return logits, prediction_sets
+    
+    def get_calibration_summary(self) -> str:
+        """Return a formatted summary of per-class calibration for paper."""
+        lines = []
+        lines.append(f"Class-Conditional Mondrian CP Calibration Summary")
+        lines.append(f"{'Class':<8} {'N_calib':<10} {'q_hat':<10} {'Fallback':<10}")
+        lines.append("-" * 40)
+        for k in range(self.num_classes):
+            n_k = self.class_sizes[k]
+            q_k = self.class_quantiles[k]
+            fb = "Yes" if k in self.calibration_info['fallback_classes'] else "No"
+            lines.append(f"{k:<8} {n_k:<10} {q_k:<10.4f} {fb:<10}")
+        lines.append("-" * 40)
+        lines.append(f"Global q_hat: {self.global_q_hat:.4f}")
+        lines.append(f"Total calib samples: {self.calibration_info['total_calib_samples']}")
+        return "\n".join(lines)
 
 
 # =============================================================================
